@@ -371,45 +371,44 @@ app.get("/transactions", verifyFireBaseToken, async (req, res) => {
 
     // GET /api/questions with filters
     app.get("/questions", async (req, res) => {
-      try {
-        const {
-          class: cls,
-          subject,
-          chapter,
-          difficulty,
-          medium,
-          search,
-        } = req.query;
+  try {
+    const {
+      group,
+      class: cls,
+      subject,
+      chapter,
+      topic,
+      medium,
+      questionType,
+    } = req.query;
 
-        console.log(req.query);
+    const query = {};
 
-        const query = {};
-
-        if (cls) query.class = cls;
-        if (subject) query.subject = subject;
-        if (chapter) query.chapter = chapter;
-        if (difficulty) query.difficulty = difficulty;
-        if (medium) query.medium = medium;
-
-        if (search) {
-          const searchRegex = new RegExp(search, "i");
-          query.$or = [
-            { question: searchRegex },
-            { subject: searchRegex },
-            { chapter: searchRegex },
-            { topic: searchRegex },
-            { tags: searchRegex },
-            { explanation: searchRegex },
-          ];
-        }
-
-        const questions = await mcqCollection.find(query).toArray();
-        res.json(questions);
-      } catch (error) {
-        console.error("Error fetching questions:", error);
-        res.status(500).json({ error: "Failed to fetch questions" });
+    // ✅ only add if value is not empty
+    const addField = (field, value) => {
+      if (value && value.trim() !== "") {
+        query[field] = value.trim();
       }
-    });
+    };
+
+    addField("group", group);
+    addField("class", cls);
+    addField("subject", subject);
+    addField("chapter", chapter);
+    addField("topic", topic);
+    addField("medium", medium);
+    addField("questionType", questionType);
+    
+    console.log("🔍 Final Query:", query);
+
+    const questions = await mcqCollection.find(query).toArray();
+    res.json(questions);
+  } catch (error) {
+    console.error("Error fetching questions:", error);
+    res.status(500).json({ error: "Failed to fetch questions" });
+  }
+});
+
 
     // Send a ping to confirm a successful connection
     await client.db("admin").command({ ping: 1 });
