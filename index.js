@@ -5,16 +5,26 @@ const cors = require("cors");
 // const bodyParser = require("body-parser");
 // const fs = require("fs");
 const { MongoClient, ServerApiVersion } = require("mongodb");
+const admin = require("firebase-admin");
 
 const app = express();
-const port = process.env.PORT || 3000;
+const port = process.env.PORT || 5000;
 
 // Middleware
 app.use(cors());
 app.use(express.json());
 
-const uri =
-  "mongodb+srv://mcq_bank:Gp59B5sBd4OcbUAf@cluster0.zmtgsgq.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0";
+
+const decoded = Buffer.from(process.env.FIREBASE_SERVICE_ACCOUNT_KEY, "base64").toString("utf8");
+const serviceAccount = JSON.parse(decoded);
+
+// const serviceAccount = require("./firebase-question-paper-builder.json");
+
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount)
+});
+
+const uri = `mongodb+srv://${process.env.DB_ADMIN}:${process.env.DB_PASS}@cluster0.zmtgsgq.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0`;
 
 // Create a MongoClient with a MongoClientOptions object to set the Stable API version
 const client = new MongoClient(uri, {
@@ -32,154 +42,276 @@ async function run() {
 
     const db = client.db("mcq_bank"); // Database
     const mcqCollection = db.collection("questions"); // Collection
+    const userCollection = db.collection("users");
+    const transactionCollection = db.collection("transactions");
+
+
+    const verifyFireBaseToken = async (req, res, next) => {
+      // console.log("token in the middleware", req.headers);
+
+      const authHeader = req.headers?.authorization;
+
+      if (!authHeader?.startsWith("Bearer ")) {
+        return res
+          .status(401)
+          .send({ error: "Unauthorized access - no token" });
+      }
+
+      const token = authHeader.split(" ")[1];
+
+      if (!token) {
+        return res
+          .status(401)
+          .send({ error: "Unauthorized access - no token" });
+      }
+
+      try {
+        const decodedUser = await admin.auth().verifyIdToken(token);
+        req.decoded = decodedUser;
+        next();
+      } catch (error) {
+        return res.status(403).send({ error: "Forbidden - invalid token" });
+      }
+
+      //   next();
+    };
 
     // Replace both GET endpoints with this single one:
-app.get("/api/questions", async (req, res) => {
+    app.get("/api/questions", verifyFireBaseToken,    async (req, res) => {
+      try {
+        const {
+          group,
+          class: cls,
+          subject,
+          chapter,
+          topic,
+          difficulty,
+          medium,
+          search,
+        } = req.query;
+
+        console.log("Incoming query:", req.query);
+
+        const query = {};
+
+        if (group) query.group = group;
+        if (cls) query.class = cls;
+        if (subject) query.subject = subject;
+        if (chapter) query.chapter = chapter;
+        if (topic) query.topic = topic;
+        if (difficulty) query.difficulty = difficulty;
+        if (medium) query.medium = medium;
+
+        if (search) {
+          const searchRegex = new RegExp(search, "i");
+          query.$or = [
+            { question: searchRegex },
+            { subject: searchRegex },
+            { chapter: searchRegex },
+            { topic: searchRegex },
+            { tags: searchRegex },
+            { explanation: searchRegex },
+          ];
+        }
+
+        const questions = await mcqCollection.find(query).toArray();
+        res.json(questions);
+      } catch (error) {
+        console.error("Error fetching questions:", error);
+        res.status(500).json({ error: "Failed to fetch questions" });
+      }
+    });
+
+   
+    app.post("/users", async (req, res) => {
+      const user = req.body;
+      const { email } = user;
+
+      if (!email) {
+        return res.status(400).send({ message: "Email is required" });
+      }
+
+      // Check if user already exists
+      const existingUser = await userCollection.findOne({ email });
+
+      if (existingUser) {
+        return res.send({ message: "User already exists", inserted: false });
+      }
+
+      // Set default role if not provided
+      user.role = user.role || "user";
+
+      const result = await userCollection.insertOne(user);
+      res.send({
+        message: "User created",
+        inserted: true,
+        userId: result.insertedId,
+      });
+    });
+
+    app.get("/users/referral-exists/:code", async (req, res) => {
+      const { code } = req.params;
+        
+      if (!code) {
+        return res.status(400).send({ error: "Referral code is required" });
+      }
+    
+      try {
+        const existing = await userCollection.findOne({ referral_link: code });
+        res.send({ exists: !!existing });
+      } catch (error) {
+        console.error("Error checking referral code:", error);
+        res.status(500).send({ error: "Internal server error" });
+      }
+    });
+
+    // Get currently logged-in user
+app.get("/users/me", verifyFireBaseToken, async (req, res) => {
   try {
-    const {
-      group,
-      class: cls,
-      subject,
-      chapter,
-      topic,
-      difficulty,
-      medium,
-      search
-    } = req.query;
+    const email = req.decoded.email; // decoded by Firebase token
 
-    console.log("Incoming query:", req.query);
-
-    const query = {};
-
-    if (group) query.group = group;
-    if (cls) query.class = cls;
-    if (subject) query.subject = subject;
-    if (chapter) query.chapter = chapter;
-    if (topic) query.topic = topic;
-    if (difficulty) query.difficulty = difficulty;
-    if (medium) query.medium = medium;
-
-    if (search) {
-      const searchRegex = new RegExp(search, "i");
-      query.$or = [
-        { question: searchRegex },
-        { subject: searchRegex },
-        { chapter: searchRegex },
-        { topic: searchRegex },
-        { tags: searchRegex },
-        { explanation: searchRegex }
-      ];
+    if (!email) {
+      return res.status(400).json({ error: "Email not found in token" });
     }
 
-    const questions = await mcqCollection.find(query).toArray();
-    res.json(questions);
-  } catch (error) {
-    console.error("Error fetching questions:", error);
-    res.status(500).json({ error: "Failed to fetch questions" });
+    const user = await userCollection.findOne({ email });
+
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    res.json(user);
+  } catch (err) {
+    console.error("Error fetching user:", err);
+    res.status(500).json({ error: "Failed to fetch user" });
   }
 });
 
 
-// app.post("/api/questions/filter", async (req, res) => {
-//   try {
-//     const { class: cls, subject, chapter, difficulty, medium, search } = req.body;
+// PATCH /users/deduct-balance
+app.patch("/users/deduct-balance", verifyFireBaseToken, async (req, res) => {
+  try {
+    const { amount, details } = req.body;
+    const userEmail = req.decoded.email; // ✅ correct field from Firebase token
 
-//     console.log(req.body);
+    if (!userEmail) {
+      return res.status(400).json({ message: "Email not found in token" });
+    }
 
-//     const query = {};
+    const user = await userCollection.findOne({ email: userEmail });
 
-//     if (cls) query.class = cls;
-//     if (subject) query.subject = subject;
-//     if (chapter) query.chapter = chapter;
-//     if (difficulty) query.difficulty = difficulty;
-//     if (medium) query.medium = medium;
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
 
-//     if (search) {
-//       const searchRegex = new RegExp(search, "i");
-//       query.$or = [
-//         { question: searchRegex },
-//         { subject: searchRegex },
-//         { chapter: searchRegex },
-//         { topic: searchRegex },
-//         { tags: searchRegex },
-//         { explanation: searchRegex },
-//       ];
-//     }
+    if (user.wallet_balance < amount) {
+      return res.status(400).json({ message: "Insufficient balance" });
+    }
 
-//     const questions = await mcqCollection.find(query).toArray();
-//     res.json(questions);
-//   } catch (error) {
-//     console.error("Error fetching questions:", error);
-//     res.status(500).json({ error: "Failed to fetch questions" });
-//   }
-// });
+    await userCollection.updateOne(
+      { email: userEmail },
+      { $inc: { wallet_balance: -amount } }
+    );
 
+    // Log transaction
+    const transaction = {
+      email: userEmail,
+      amount,
+      type: "purchase",
+      details: details || {},
+      balanceAfter: user.wallet_balance - amount,
+      createdAt: new Date().toISOString(),
+    };
 
-    // GET all questions
-    // app.get("/api/questions", async (req, res) => {
-    //   try {
-    //     const questions = await mcqCollection.find().toArray();
-    //     res.json(questions);
-    //   } catch (error) {
-    //     res.status(500).json({ error: "Failed to fetch questions" });
-    //   }
-    // });
+    await transactionCollection.insertOne(transaction);
+
+    res.json({ message: "Balance deducted successfully" });
+  } catch (error) {
+    console.error("❌ Deduct balance error:", error);
+    res.status(500).json({ message: "Internal Server Error" });
+  }
+});
+
+// GET /transactions (fetch transactions for logged-in user)
+app.get("/transactions", verifyFireBaseToken, async (req, res) => {
+  try {
+    const userEmail = req.decoded.email;
+
+    const transactions = await transactionCollection
+      .find({ email: userEmail })
+      .sort({ createdAt: -1 }) // newest first
+      .toArray();
+
+    res.json(transactions);
+  } catch (error) {
+    console.error("❌ Fetch transactions error:", error);
+    res.status(500).json({ message: "Internal Server Error" });
+  }
+});
+
 
     // POST new question
     app.post("/api/questions", async (req, res) => {
-  const payload = req.body;
-  console.log(payload);
+      const payload = req.body;
+      console.log(payload);
 
-  // ✅ allow SmartQuestionBuilder structure
-  if (!payload || (!payload.question && !payload.questionData)) {
-    return res.status(400).json({ error: "Invalid question data" });
-  }
+      // ✅ allow SmartQuestionBuilder structure
+      if (!payload || (!payload.question && !payload.questionData)) {
+        return res.status(400).json({ error: "Invalid question data" });
+      }
 
-  try {
-    const result = await mcqCollection.insertOne(payload);
-    res.status(201).json({
-      message: "Question saved successfully",
-      insertedId: result.insertedId,
+      try {
+        const result = await mcqCollection.insertOne(payload);
+        res.status(201).json({
+          message: "Question saved successfully",
+          insertedId: result.insertedId,
+        });
+      } catch (error) {
+        res.status(500).json({ error: "Failed to save question" });
+      }
     });
-  } catch (error) {
-    res.status(500).json({ error: "Failed to save question" });
-  }
-});
 
     // GET /api/questions with filters
-app.get("/questions", async (req, res) => {
-  try {
-    const { class: cls, subject, chapter, difficulty, medium, search } = req.query;
+    app.get("/questions", async (req, res) => {
+      try {
+        const {
+          class: cls,
+          subject,
+          chapter,
+          difficulty,
+          medium,
+          search,
+        } = req.query;
 
-    console.log(req.query);
+        console.log(req.query);
 
-    const query = {};
+        const query = {};
 
-    if (cls) query.class = cls;
-    if (subject) query.subject = subject;
-    if (chapter) query.chapter = chapter;
-    if (difficulty) query.difficulty = difficulty;
-    if (medium) query.medium = medium;
+        if (cls) query.class = cls;
+        if (subject) query.subject = subject;
+        if (chapter) query.chapter = chapter;
+        if (difficulty) query.difficulty = difficulty;
+        if (medium) query.medium = medium;
 
-    if (search) {
-      const searchRegex = new RegExp(search, "i");
-      query.$or = [
-        { question: searchRegex },
-        { subject: searchRegex },
-        { chapter: searchRegex },
-        { topic: searchRegex },
-        { tags: searchRegex },
-        { explanation: searchRegex }
-      ];
-    }
+        if (search) {
+          const searchRegex = new RegExp(search, "i");
+          query.$or = [
+            { question: searchRegex },
+            { subject: searchRegex },
+            { chapter: searchRegex },
+            { topic: searchRegex },
+            { tags: searchRegex },
+            { explanation: searchRegex },
+          ];
+        }
 
-    const questions = await mcqCollection.find(query).toArray();
-    res.json(questions);
-  } catch (error) {
-    console.error("Error fetching questions:", error);
-    res.status(500).json({ error: "Failed to fetch questions" });
-  }
-});
+        const questions = await mcqCollection.find(query).toArray();
+        res.json(questions);
+      } catch (error) {
+        console.error("Error fetching questions:", error);
+        res.status(500).json({ error: "Failed to fetch questions" });
+      }
+    });
 
     // Send a ping to confirm a successful connection
     await client.db("admin").command({ ping: 1 });
