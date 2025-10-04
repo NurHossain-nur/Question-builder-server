@@ -2,6 +2,7 @@
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
+const { ObjectId } = require("mongodb");
 // const bodyParser = require("body-parser");
 // const fs = require("fs");
 const { MongoClient, ServerApiVersion } = require("mongodb");
@@ -44,6 +45,7 @@ async function run() {
     const mcqCollection = db.collection("questions"); // Collection
     const userCollection = db.collection("users");
     const transactionCollection = db.collection("transactions");
+    const usersQuestionsCollection = db.collection("collections");
 
 
     const verifyFireBaseToken = async (req, res, next) => {
@@ -121,6 +123,102 @@ async function run() {
         res.status(500).json({ error: "Failed to fetch questions" });
       }
     });
+
+    // POST usersCreatedQuestions
+    app.post("/collections", verifyFireBaseToken, async (req, res) => {
+  try {
+    const email = req.decoded.email;
+    const { name, questions, createdAt } = req.body;
+
+    if (!name || !questions || typeof questions !== "object") {
+      return res.status(400).json({ message: "Invalid collection data" });
+    }
+
+    const newCollection = {
+      userEmail: email,
+      name,
+      questions,
+      createdAt: createdAt || new Date().toISOString(),
+    };
+
+    const result = await usersQuestionsCollection.insertOne(newCollection);
+
+    res.status(201).json({
+      message: "Collection saved successfully",
+      insertedId: result.insertedId,
+    });
+  } catch (error) {
+    console.error("❌ Error saving collection:", error);
+    res.status(500).json({ message: "Internal Server Error" });
+  }
+});
+
+// GET usersCreatedQuestions
+app.get("/collections", verifyFireBaseToken, async (req, res) => {
+  try {
+    const email = req.decoded.email;
+
+    const collections = await usersQuestionsCollection
+      .find({ userEmail: email })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.json(collections);
+  } catch (error) {
+    console.error("❌ Error fetching collections:", error);
+    res.status(500).json({ message: "Internal Server Error" });
+  }
+});
+
+// inside run(), after defining collectionCollection
+app.get("/collections/:id", verifyFireBaseToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const email = req.decoded.email;
+
+    const objId = new ObjectId(id);
+    const coll = await usersQuestionsCollection.findOne({
+      _id: objId,
+      userEmail: email,
+    });
+
+    if (!coll) {
+      return res.status(404).json({ message: "Not found or not allowed" });
+    }
+
+    res.json(coll);
+  } catch (err) {
+    console.error("Error fetching collection:", err);
+    res.status(500).json({ message: "Internal Server Error" });
+  }
+});
+
+// DELETE /collections/:id
+app.delete("/collections/:id", verifyFireBaseToken, async (req, res) => {
+  try {
+    const email = req.decoded.email;
+    const collId = req.params.id;
+
+    // Validate ObjectId
+    if (!ObjectId.isValid(collId)) {
+      return res.status(400).json({ message: "Invalid collection ID format" });
+    }
+
+    const result = await usersQuestionsCollection.deleteOne({
+      _id: new ObjectId(collId),
+      userEmail: email  // ensure user only deletes their own
+    });
+
+    if (result.deletedCount === 0) {
+      return res.status(404).json({ message: "Collection not found or not your own" });
+    }
+    res.json({ message: "Deleted successfully" });
+  } catch (err) {
+    console.error("Error deleting collection:", err);
+    res.status(500).json({ message: "Internal Server Error" });
+  }
+});
+
 
    
     app.post("/users", async (req, res) => {
