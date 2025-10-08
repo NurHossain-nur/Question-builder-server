@@ -428,5 +428,5 @@ app.get("/", (req, res) => {
 
 // Start server
 app.listen(port, () => {
-  console.log(`✅ Server listening on http://localhost:${port}`);
+  console.log(`✅ Server listening on port ${port}`);
 });
