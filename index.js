@@ -11,6 +11,8 @@ const admin = require("firebase-admin");
 const app = express();
 const port = process.env.PORT || 5000;
 
+const moment = require('moment-timezone');
+
 // Middleware
 app.use(cors());
 // app.use(express.json());
@@ -307,11 +309,17 @@ app.get("/public-exam/:id", async (req, res) => {
       return res.status(404).json({ error: "Exam not found" });
     }
 
-    // Combine startDate and startTime into a single Date object
-    const startDateTime = new Date(`${exam.startDate}T${exam.startTime}:00`);
-    const endDateTime = new Date(`${exam.endDate}T${exam.endTime}:00`);
+    // // Combine startDate and startTime into a single Date object
+    // const startDateTime = new Date(`${exam.startDate}T${exam.startTime}:00`);
+    // const endDateTime = new Date(`${exam.endDate}T${exam.endTime}:00`);
 
-    const now = new Date();
+    // const now = new Date();
+
+    // ✅ Treat exam start and end as Bangladesh time (Asia/Dhaka)
+    const startDateTime = moment.tz(`${exam.startDate} ${exam.startTime}`, "YYYY-MM-DD HH:mm", "Asia/Dhaka");
+    const endDateTime = moment.tz(`${exam.endDate} ${exam.endTime}`, "YYYY-MM-DD HH:mm", "Asia/Dhaka");
+
+    const now = moment.tz("Asia/Dhaka"); // ✅ Use same timezone for now
 
 
     let questionsToSend = {};
@@ -340,6 +348,7 @@ app.get("/public-exam/:id", async (req, res) => {
     const response = {
       ...exam,
       questions: questionsToSend,
+      isLive: now.isBetween(startDateTime, endDateTime), // Optional for frontend
     };
 
     return res.json(response);
