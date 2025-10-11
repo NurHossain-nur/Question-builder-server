@@ -13,7 +13,10 @@ const port = process.env.PORT || 5000;
 
 // Middleware
 app.use(cors());
-app.use(express.json());
+// app.use(express.json());
+
+app.use(express.json({ limit: '5mb' }));
+app.use(express.urlencoded({ extended: true, limit: '5mb' }));
 
 
 const decoded = Buffer.from(process.env.FB_SERVICE_KEY, "base64").toString("utf8");
@@ -648,6 +651,27 @@ app.get("/transactions", verifyFireBaseToken, async (req, res) => {
   } catch (error) {
     console.error("Error fetching questions:", error);
     res.status(500).json({ error: "Failed to fetch questions" });
+  }
+});
+
+// ✅ GET /api/questions/by-chapter?name=গতি
+app.get("/api/questions/by-chapter",  async (req, res) => {
+  try {
+    const { name } = req.query;
+
+    if (!name) {
+      return res.status(400).json({ error: "Chapter name is required" });
+    }
+
+    const questions = await mcqCollection.find({ chapter: name }).toArray();
+
+    res.json({
+      count: questions.length,
+      data: questions,
+    });
+  } catch (error) {
+    console.error("❌ Error fetching questions by chapter:", error);
+    res.status(500).json({ message: "Internal Server Error" });
   }
 });
 
