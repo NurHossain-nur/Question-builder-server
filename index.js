@@ -46,7 +46,9 @@ async function run() {
     const userCollection = db.collection("users");
     const transactionCollection = db.collection("transactions");
     const usersQuestionsCollection = db.collection("collections");
-
+    const onlineExamCollections = db.collection("online_exam_collections");
+    const examResponsesCollection = db.collection("online_exam_response_collections");
+    
 
     const verifyFireBaseToken = async (req, res, next) => {
       // console.log("token in the middleware", req.headers);
@@ -219,6 +221,246 @@ app.delete("/collections/:id", verifyFireBaseToken, async (req, res) => {
   }
 });
 
+
+// ✅ POST /online-exam-collections
+app.post("/online-exam-collections", verifyFireBaseToken, async (req, res) => {
+  try {
+    const email = req.decoded.email;
+    const { name, questions, createdAt } = req.body;
+
+    if (!name || !questions || typeof questions !== "object") {
+      return res.status(400).json({ message: "Invalid collection data" });
+    }
+
+    const newCollection = {
+      name,
+      questions,
+      createdBy: email,
+      createdAt: createdAt || new Date().toISOString(),
+    };
+
+    const result = await onlineExamCollections.insertOne(newCollection);
+
+    res.status(201).json({
+      message: "Online Exam Collection saved successfully",
+      insertedId: result.insertedId,
+    });
+  } catch (error) {
+    console.error("❌ Error saving online exam collection:", error);
+    res.status(500).json({ message: "Internal Server Error" });
+  }
+});
+
+// ✅ GET /online-exam-collections
+app.get("/online-exam-collections", verifyFireBaseToken, async (req, res) => {
+  try {
+    const email = req.decoded.email;
+    const collections = await onlineExamCollections
+      .find({ createdBy: email })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.json(collections);
+  } catch (err) {
+    console.error("❌ Error fetching online exam collections:", err);
+    res.status(500).json({ message: "Internal Server Error" });
+  }
+});
+
+// ✅ GET /online-exam-collections/:id
+app.get("/online-exam-collections/:id", verifyFireBaseToken, async (req, res) => {
+  const collectionId = req.params.id;
+
+  try {
+    const email = req.decoded.email;
+
+    const collection = await onlineExamCollections.findOne({
+      _id: new ObjectId(collectionId),
+      createdBy: email, // Optional: to ensure the user owns this collection
+    });
+
+    if (!collection) {
+      return res.status(404).json({ message: "Collection not found" });
+    }
+
+    res.json(collection);
+  } catch (err) {
+    console.error("❌ Error fetching exam collection by ID:", err);
+    res.status(500).json({ message: "Internal Server Error" });
+  }
+});
+// ✅ GET /public-exam/:id
+app.get("/public-exam/:id", async (req, res) => {
+  const  id = req.params.id;
+
+  try {
+
+    // Fetch exam from collection
+    const exam = await onlineExamCollections.findOne({
+      _id: new ObjectId(id)
+    });
+
+    if (!exam) {
+      return res.status(404).json({ error: "Exam not found" });
+    }
+
+    // Combine startDate and startTime into a single Date object
+    const startDateTime = new Date(`${exam.startDate}T${exam.startTime}:00`);
+    const endDateTime = new Date(`${exam.endDate}T${exam.endTime}:00`);
+
+    const now = new Date();
+
+
+    let questionsToSend = {};
+
+    if (now >= startDateTime && now <= endDateTime) {
+      // Extract and flatten all questions from exam
+      const allQuestions = Object.values(exam.questions || {}).flat();
+
+      // Simplify questions to include only text and options
+      questionsToSend = allQuestions.map((q) => ({
+        question_id: q?._id,
+        text: q?.question?.text || [],
+        options: (q?.options || []).map((opt) => ({
+          label: opt.label,
+          text: opt.text,
+          image: opt.image || "",
+        })),
+      }));
+    } else {
+      // Before start time: send only question count as a number
+      const allQuestions = Object.values(exam.questions || {}).flat();
+      questionsToSend = allQuestions.length; // send number of questions
+    }
+
+    // Build final response: full exam object but override `questions`
+    const response = {
+      ...exam,
+      questions: questionsToSend,
+    };
+
+    return res.json(response);
+  } catch (error) {
+    console.error("❌ Error loading public exam:", error);
+    return res.status(500).json({ error: "Internal Server Error" });
+  }
+});
+
+// PATCH /online-exam-collections/:id
+app.patch("/online-exam-collections/:id", verifyFireBaseToken, async (req, res) => {
+  try {
+    const collectionId = req.params.id;
+    const email = req.decoded.email;
+    const updateData = req.body;
+
+    const result = await onlineExamCollections.updateOne(
+      { _id: new ObjectId(collectionId), createdBy: email },
+      { $set: updateData }
+    );
+
+    if (result.modifiedCount === 0) {
+      return res.status(404).json({ message: "Collection not found or not updated" });
+    }
+
+    res.status(200).json({ message: "Collection updated successfully" });
+  } catch (err) {
+    console.error("❌ Error updating collection:", err);
+    res.status(500).json({ message: "Internal Server Error" });
+  }
+});
+
+// ✅ POST /exam-responses/submit
+app.post("/exam-responses/submit", verifyFireBaseToken, async (req, res) => {
+  try {
+    const studentEmail = req.decoded.email;
+    const {
+      examId,
+      examName,
+      studentName,
+      answers,
+      durationTaken,
+    } = req.body;
+
+    if (!examId || !studentName || !answers || !Array.isArray(answers)) {
+      return res.status(400).json({ message: "Invalid exam response data" });
+    }
+
+    // 1. Save exam response to a new collection
+    const responseDoc = {
+      examId,
+      examName,
+      studentName,
+      studentEmail,
+      answers,
+      durationTaken,
+      submittedAt: new Date().toISOString(),
+    };
+
+    const saveResponse = await examResponsesCollection.insertOne(responseDoc);
+
+    // 2. Update the original exam collection to add student email to completedStudents
+    await onlineExamCollections.updateOne(
+      { _id: new ObjectId(examId) },
+      { $addToSet: { completedStudents: studentEmail } } // avoids duplicates
+    );
+
+    res.status(201).json({
+      message: "✅ Exam submitted and recorded successfully.",
+      insertedId: saveResponse.insertedId,
+    });
+  } catch (error) {
+    console.error("❌ Error submitting exam response:", error);
+    res.status(500).json({ message: "Internal Server Error" });
+  }
+});
+
+
+// ✅ GET /exam-responses/student?email=someone@gmail.com
+app.get("/exam-responses/student", verifyFireBaseToken, async (req, res) => {
+  const studentEmail = req.query.email;
+
+  if (!studentEmail) {
+    return res.status(400).json({ message: "Missing email" });
+  }
+
+  try {
+    const responses = await examResponsesCollection
+      .find({ studentEmail })
+      .sort({ submittedAt: -1 })
+      .toArray();
+
+    // Optionally populate exam name if needed from onlineExamCollections
+    // or store it in responses during submission for faster access.
+
+    res.json(responses);
+  } catch (err) {
+    console.error("❌ Failed to fetch student exam responses:", err);
+    res.status(500).json({ message: "Internal Server Error" });
+  }
+});
+
+
+// ✅ GET /online-exam/:id  for show result
+app.get("/online-exam/:id", async (req, res) => {
+  const { id } = req.params;
+
+  if (!id) {
+    return res.status(400).json({ message: "Missing exam ID" });
+  }
+
+  try {
+    const exam = await onlineExamCollections.findOne({ _id: new ObjectId(id) });
+
+    if (!exam) {
+      return res.status(404).json({ message: "Exam not found" });
+    }
+
+    res.status(200).json(exam);
+  } catch (error) {
+    console.error("❌ Error fetching exam by ID:", error);
+    res.status(500).json({ message: "Internal Server Error" });
+  }
+});
 
    
     app.post("/users", async (req, res) => {
@@ -428,5 +670,5 @@ app.get("/", (req, res) => {
 
 // Start server
 app.listen(port, () => {
-  console.log(`✅ Server listening on port ${port}`);
+  console.log(`✅ Server listening on port http://localhost:${port}`);
 });
