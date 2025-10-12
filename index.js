@@ -332,6 +332,7 @@ app.get("/public-exam/:id", async (req, res) => {
       questionsToSend = allQuestions.map((q) => ({
         question_id: q?._id,
         text: q?.question?.text || [],
+        image: q?.question?.image || [],
         options: (q?.options || []).map((opt) => ({
           label: opt.label,
           text: opt.text,
