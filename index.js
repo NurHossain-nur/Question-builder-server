@@ -392,6 +392,8 @@ app.post("/exam-responses/submit", verifyFireBaseToken, async (req, res) => {
       studentName,
       answers,
       durationTaken,
+      negativeMarks,
+      marksPerQuestion,
     } = req.body;
 
     if (!examId || !studentName || !answers || !Array.isArray(answers)) {
@@ -406,6 +408,8 @@ app.post("/exam-responses/submit", verifyFireBaseToken, async (req, res) => {
       studentEmail,
       answers,
       durationTaken,
+      negativeMarks,
+      marksPerQuestion,
       submittedAt: new Date().toISOString(),
     };
 
