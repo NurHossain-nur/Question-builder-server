@@ -294,13 +294,15 @@ app.get("/online-exam-collections/:id", verifyFireBaseToken, async (req, res) =>
     res.status(500).json({ message: "Internal Server Error" });
   }
 });
-// ✅ GET /public-exam/:id
-app.get("/public-exam/:id", async (req, res) => {
-  const  id = req.params.id;
+
+
+// ✅ GET /public-exam/:id (Protected: Requires Login for EVERYONE)
+app.get("/public-exam/:id", verifyFireBaseToken, async (req, res) => {
+  const id = req.params.id;
+  const userEmail = req.decoded.email; // ✅ Available because middleware verifies token first
 
   try {
-
-    // Fetch exam from collection
+    // 1. Fetch exam from collection
     const exam = await onlineExamCollections.findOne({
       _id: new ObjectId(id)
     });
@@ -309,26 +311,35 @@ app.get("/public-exam/:id", async (req, res) => {
       return res.status(404).json({ error: "Exam not found" });
     }
 
-    // // Combine startDate and startTime into a single Date object
-    // const startDateTime = new Date(`${exam.startDate}T${exam.startTime}:00`);
-    // const endDateTime = new Date(`${exam.endDate}T${exam.endTime}:00`);
+    // 🔒 2. PRIVACY CHECK (Only for Private Exams)
+    // Since middleware passed, we know they are logged in. Now check if they are allowed.
+    if (exam.settings?.accessType === "private") {
+      const allowedList = exam.settings.allowedEmails || [];
+      
+      // Allow Creator OR Whitelisted Emails
+      if (userEmail !== exam.createdBy && !allowedList.includes(userEmail)) {
+        return res.status(403).json({ 
+          error: "Access Denied: You are not in the allowed list for this private exam." 
+        });
+      }
+    }
 
-    // const now = new Date();
-
-    // ✅ Treat exam start and end as Bangladesh time (Asia/Dhaka)
+    // 3. Time & Logic Setup (Asia/Dhaka)
     const startDateTime = moment.tz(`${exam.startDate} ${exam.startTime}`, "YYYY-MM-DD HH:mm", "Asia/Dhaka");
     const endDateTime = moment.tz(`${exam.endDate} ${exam.endTime}`, "YYYY-MM-DD HH:mm", "Asia/Dhaka");
-
-    const now = moment.tz("Asia/Dhaka"); // ✅ Use same timezone for now
-
+    const now = moment.tz("Asia/Dhaka");
 
     let questionsToSend = {};
+    let isExamStarted = false;
 
+    // 4. Question Logic
     if (now >= startDateTime && now <= endDateTime) {
-      // Extract and flatten all questions from exam
+      isExamStarted = true;
+      
+      // Extract and flatten all questions
       const allQuestions = Object.values(exam.questions || {}).flat();
 
-      // Simplify questions to include only text and options
+      // Simplify questions (Hide correct answers/solutions)
       questionsToSend = allQuestions.map((q) => ({
         question_id: q?._id,
         text: q?.question?.text || [],
@@ -340,19 +351,36 @@ app.get("/public-exam/:id", async (req, res) => {
         })),
       }));
     } else {
-      // Before start time: send only question count as a number
+      // Before start time or after end time: Send only count (security best practice)
       const allQuestions = Object.values(exam.questions || {}).flat();
-      questionsToSend = allQuestions.length; // send number of questions
+      questionsToSend = allQuestions.length; 
     }
 
-    // Build final response: full exam object but override `questions`
+    // 5. Build Final Response
     const response = {
-      ...exam,
+      _id: exam._id,
+      name: exam.name,
+      duration: exam.duration,
+      description: exam.description,
+      instructions: exam.instructions,
+      warnings: exam.warnings,
+      startDate: exam.startDate,
+      startTime: exam.startTime,
+      endDate: exam.endDate,
+      endTime: exam.endTime,
+      
+      // Send Settings & Completed Students list for frontend logic
+      settings: exam.settings, 
+      completedStudents: exam.completedStudents || [], 
+
       questions: questionsToSend,
-      isLive: now.isBetween(startDateTime, endDateTime), // Optional for frontend
+      isLive: now.isBetween(startDateTime, endDateTime),
+      isExamStarted: isExamStarted,
+      currentUser: userEmail // Optional: confirming who is viewing
     };
 
     return res.json(response);
+
   } catch (error) {
     console.error("❌ Error loading public exam:", error);
     return res.status(500).json({ error: "Internal Server Error" });
@@ -378,6 +406,54 @@ app.patch("/online-exam-collections/:id", verifyFireBaseToken, async (req, res) 
     res.status(200).json({ message: "Collection updated successfully" });
   } catch (err) {
     console.error("❌ Error updating collection:", err);
+    res.status(500).json({ message: "Internal Server Error" });
+  }
+});
+
+// ✅ GET /exam-responses/all/:examId - Fetch all responses for leaderboard
+app.get("/exam-responses/all/:examId", async (req, res) => {
+  const examId = req.params.examId;
+
+  try {
+    // No auth required if public leaderboard, otherwise add verifyFireBaseToken
+    // Fetch all responses matching the examId
+    const responses = await examResponsesCollection
+      .find({ examId: examId })
+      .sort({ submittedAt: 1 }) // Sort logic happens mostly on frontend for ranks
+      .toArray();
+
+    res.json(responses);
+  } catch (err) {
+    console.error("❌ Error fetching exam responses:", err);
+    res.status(500).json({ message: "Internal Server Error" });
+  }
+});
+
+// ✅ DELETE /online-exam-collections/:id
+app.delete("/online-exam-collections/:id", verifyFireBaseToken, async (req, res) => {
+  try {
+    const email = req.decoded.email;
+    const id = req.params.id;
+
+    // Validate ObjectId
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ message: "Invalid ID format" });
+    }
+
+    // Delete from the correct collection (onlineExamCollections)
+    // Make sure to match the user field (usually 'createdBy' for exams based on your previous codes)
+    const result = await onlineExamCollections.deleteOne({
+      _id: new ObjectId(id),
+      createdBy: email // Ensure user only deletes their own exam
+    });
+
+    if (result.deletedCount === 0) {
+      return res.status(404).json({ message: "Exam not found or not authorized" });
+    }
+
+    res.json({ message: "Exam deleted successfully" });
+  } catch (err) {
+    console.error("❌ Error deleting exam:", err);
     res.status(500).json({ message: "Internal Server Error" });
   }
 });
