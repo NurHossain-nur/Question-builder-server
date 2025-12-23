@@ -54,7 +54,7 @@ async function run() {
     const onlineExamCollections = db.collection("online_exam_collections");
     const examResponsesCollection = db.collection("online_exam_response_collections");
     
-
+    // Firebase Token Verification Middleware
     const verifyFireBaseToken = async (req, res, next) => {
       // console.log("token in the middleware", req.headers);
 
@@ -83,6 +83,21 @@ async function run() {
       }
 
       //   next();
+    };
+
+
+    // Add this AFTER verifyFireBaseToken
+    // Admin Role Verification Middleware
+    const verifyAdmin = async (req, res, next) => {
+      const email = req.decoded.email;
+      const user = await userCollection.findOne({ email: email });
+
+      // Check if role is teacher OR coaching_center OR admin
+      if ( user?.role === 'admin' || user?.role === 'moderator') {
+        next();
+      } else {
+        return res.status(403).send({ error: "Forbidden access: Teachers only" });
+      }
     };
 
     // Replace both GET endpoints with this single one:
@@ -762,6 +777,262 @@ app.get("/api/questions/by-chapter",  async (req, res) => {
   } catch (error) {
     console.error("❌ Error fetching questions by chapter:", error);
     res.status(500).json({ message: "Internal Server Error" });
+  }
+});
+
+
+// ✅ PATCH /users/student-profile
+// Updates the user with group, division, and batch info
+app.patch("/users/student-profile", verifyFireBaseToken, async (req, res) => {
+  try {
+    const email = req.decoded.email;
+    const profileData = req.body; // { group, division, batch, class }
+
+    const filter = { email: email };
+    const updateDoc = {
+      $set: {
+        studentProfile: profileData, // We save it under a specific field
+        isStudentProfileComplete: true
+      },
+    };
+
+    const result = await userCollection.updateOne(filter, updateDoc);
+    res.send(result);
+  } catch (error) {
+    console.error("Error updating profile:", error);
+    res.status(500).send({ message: "Failed to update profile" });
+  }
+});
+
+
+
+// ✅ GET /api/practice-stats
+// Returns real counts based on User Group (Admission/HSC/SSC)
+app.get("/api/practice-stats", verifyFireBaseToken, async (req, res) => {
+  try {
+    const { subject } = req.query;
+    const email = req.decoded.email;
+
+    if (!subject) return res.status(400).send({ message: "Subject required" });
+
+    // 1. Fetch User to check their Group (Admission vs SSC/HSC)
+    const user = await userCollection.findOne({ email: email });
+    const userGroup = user?.studentProfile?.group;
+
+    // 2. Build the Match Query
+    // Base Requirement: Must be this Subject AND must be MCQ
+    const matchQuery = {
+      subject: subject,
+      questionType: "বহুনির্বাচনি প্রশ্ন" // ✅ STRICTLY MCQ ONLY
+    };
+
+    // ✅ ADMISSION LOGIC: Only show questions tagged/sourced for Admission
+    if (userGroup === "Admission") {
+      matchQuery.$or = [
+        { tags: "Admission Exam Question" },
+        { source: "Admission Exam Question" }
+      ];
+    }
+    // (Optional) You can add else if (userGroup === "SSC") logic here later if needed
+
+    // 3. Count TOTAL questions per chapter (Denominator)
+    const totalPipeline = [
+      { $match: matchQuery }, 
+      { $group: { _id: "$chapter", count: { $sum: 1 } } }
+    ];
+    const totalCounts = await mcqCollection.aggregate(totalPipeline).toArray();
+
+    // 4. Count COMPLETED questions for this user (Numerator)
+    // Note: We count from practice_history matching this subject
+    const practiceHistoryCollection = db.collection("practice_history"); 
+    
+    const progressPipeline = [
+      { $match: { userEmail: email, subject: subject } },
+      { $group: { _id: "$chapter", count: { $sum: 1 } } }
+    ];
+    const userProgress = await practiceHistoryCollection.aggregate(progressPipeline).toArray();
+
+    // 5. Merge Data
+    const stats = {};
+    
+    // Populate Totals
+    totalCounts.forEach(item => {
+      // item._id is the chapter name
+      if (item._id) { 
+        stats[item._id] = { total: item.count, completed: 0 };
+      }
+    });
+
+    // Populate Completed (Only if the chapter exists in our filtered totals)
+    userProgress.forEach(item => {
+      if (stats[item._id]) {
+        stats[item._id].completed = item.count;
+      }
+    });
+
+    res.send(stats);
+
+  } catch (error) {
+    console.error("Error fetching practice stats:", error);
+    res.status(500).send({ message: "Internal Server Error" });
+  }
+});
+
+
+
+
+// ✅ GET /api/practice-questions
+// Fetches ALL MCQs for a chapter (No Limit) + Resume Index
+app.get("/api/practice-questions", verifyFireBaseToken, async (req, res) => {
+  try {
+    const { subject, chapter } = req.query;
+    const email = req.decoded.email;
+
+    if (!subject || !chapter) {
+      return res.status(400).send({ message: "Subject and Chapter required" });
+    }
+
+    // 1. Get User Group
+    const user = await userCollection.findOne({ email });
+    const userGroup = user?.studentProfile?.group;
+
+    // 2. Build Query
+    const query = {
+      subject: subject,
+      chapter: chapter,
+      questionType: "বহুনির্বাচনি প্রশ্ন"
+    };
+
+    // 🔒 Admission Filter Logic
+    if (userGroup === "Admission") {
+      query.$or = [
+        { tags: "Admission Exam Question" },
+        { source: "Admission Exam Question" }
+      ];
+    }
+
+    // 3. Fetch ALL Questions
+    // ⚠️ IMPORTANT: We use .sort({ _id: 1 }) instead of random shuffle.
+    // This ensures "Question 10" is always the same question, allowing users to resume.
+    const questions = await mcqCollection.find(query)
+      .sort({ _id: 1 }) // Fixed order (Oldest to Newest)
+      .toArray();       // ❌ No limit() here, fetches everything
+
+    // ---------------------------------------------------------
+    // 🔥 NEW: Calculate Stats (Correct vs Wrong vs Total Attempts)
+    // ---------------------------------------------------------
+    const stats = await db.collection("practice_history").aggregate([
+        { 
+            $match: { 
+                userEmail: email, 
+                subject: subject, 
+                chapter: chapter 
+            } 
+        },
+        { 
+            $group: { 
+                _id: null, 
+                // Count total documents found for this chapter
+                totalAttempts: { $sum: 1 }, 
+                // If isCorrect is true, add 1, else add 0
+                totalCorrect: { $sum: { $cond: ["$isCorrect", 1, 0] } },
+                // If isCorrect is false, add 1, else add 0
+                totalWrong: { $sum: { $cond: ["$isCorrect", 0, 1] } } 
+            } 
+        }
+    ]).toArray();
+
+    // Handle case where user has no history yet
+    const resultStats = stats.length > 0 ? stats[0] : { totalAttempts: 0, totalCorrect: 0, totalWrong: 0 };
+
+    res.send({
+        questions: questions,
+        lastIndex: resultStats.totalAttempts, // Where to resume
+        prevCorrect: resultStats.totalCorrect, // For Green Score
+        prevWrong: resultStats.totalWrong      // For Red Score
+    });
+
+  } catch (error) {
+    console.error("Error fetching practice questions:", error);
+    res.status(500).send({ message: "Server Error" });
+  }
+});
+
+// ✅ POST /api/save-progress
+// Saves a single question attempt
+app.post("/api/save-progress", verifyFireBaseToken, async (req, res) => {
+  try {
+    const { questionId, subject, chapter, isCorrect } = req.body;
+    const email = req.decoded.email;
+
+    const practiceHistory = db.collection("practice_history");
+
+    // Update or Insert (Upsert)
+    // We use userEmail + questionId as the unique composite key
+    const filter = { userEmail: email, questionId: questionId };
+    
+    const updateDoc = {
+      $set: {
+        userEmail: email,
+        questionId: questionId,
+        subject: subject,
+        chapter: chapter,
+        isCorrect: isCorrect, // Track accuracy
+        lastAttemptedAt: new Date()
+      },
+      $inc: { attempts: 1 } // Count how many times they tried this Q
+    };
+
+    await practiceHistory.updateOne(filter, updateDoc, { upsert: true });
+
+    res.send({ success: true });
+  } catch (error) {
+    console.error("Error saving progress:", error);
+    res.status(500).send({ message: "Failed to save progress" });
+  }
+});
+
+
+
+// ✅ PATCH /users/update-profile
+// Updates User Personal Info + Student Profile
+app.patch("/users/update-profile", verifyFireBaseToken, async (req, res) => {
+  try {
+    const email = req.decoded.email;
+    const { 
+      name, mobile, DOB, gender, district, thana, 
+      studentProfile // Nested object { group, division, batch, class }
+    } = req.body;
+
+    const filter = { email: email };
+    
+    // Construct the update object dynamically
+    const updateDoc = {
+      $set: {
+        name,
+        mobile,
+        DOB,
+        gender,
+        district,
+        thana,
+        // If studentProfile is provided, update it. 
+        // This ensures we don't accidentally wipe it if it's missing in the request.
+        ...(studentProfile && { studentProfile: studentProfile }),
+        ...(studentProfile && { isStudentProfileComplete: true })
+      },
+    };
+
+    const result = await userCollection.updateOne(filter, updateDoc);
+    
+    if (result.modifiedCount > 0) {
+      res.send({ success: true, message: "Profile updated successfully" });
+    } else {
+      res.send({ success: false, message: "No changes made" });
+    }
+
+  } catch (error) {
+    console.error("Error updating profile:", error);
+    res.status(500).send({ message: "Failed to update profile" });
   }
 });
 
