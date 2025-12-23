@@ -806,8 +806,7 @@ app.patch("/users/student-profile", verifyFireBaseToken, async (req, res) => {
 
 
 
-// ✅ GET /api/practice-stats
-// Returns real counts based on User Group (Admission/HSC/SSC)
+// ✅ GET /api/practice-stats (Fixed: Nested vs Standard Grouping)
 app.get("/api/practice-stats", verifyFireBaseToken, async (req, res) => {
   try {
     const { subject } = req.query;
@@ -815,62 +814,141 @@ app.get("/api/practice-stats", verifyFireBaseToken, async (req, res) => {
 
     if (!subject) return res.status(400).send({ message: "Subject required" });
 
-    // 1. Fetch User to check their Group (Admission vs SSC/HSC)
+    // 1. Determine Grouping Mode
+    // If Bangla 1st Paper, we use "nested" mode (Chapter -> Topics)
+    const isNestedMode = subject.includes("বাংলা ১ম পত্র");
+    
+    // 2. Fetch User to check Group (Admission logic)
     const user = await userCollection.findOne({ email: email });
     const userGroup = user?.studentProfile?.group;
 
-    // 2. Build the Match Query
-    // Base Requirement: Must be this Subject AND must be MCQ
+    // 3. Build Match Query
     const matchQuery = {
       subject: subject,
-      questionType: "বহুনির্বাচনি প্রশ্ন" // ✅ STRICTLY MCQ ONLY
+      questionType: "বহুনির্বাচনি প্রশ্ন"
     };
 
-    // ✅ ADMISSION LOGIC: Only show questions tagged/sourced for Admission
     if (userGroup === "Admission") {
       matchQuery.$or = [
         { tags: "Admission Exam Question" },
         { source: "Admission Exam Question" }
       ];
     }
-    // (Optional) You can add else if (userGroup === "SSC") logic here later if needed
 
-    // 3. Count TOTAL questions per chapter (Denominator)
-    const totalPipeline = [
-      { $match: matchQuery }, 
-      { $group: { _id: "$chapter", count: { $sum: 1 } } }
-    ];
-    const totalCounts = await mcqCollection.aggregate(totalPipeline).toArray();
+    let stats = {};
 
-    // 4. Count COMPLETED questions for this user (Numerator)
-    // Note: We count from practice_history matching this subject
-    const practiceHistoryCollection = db.collection("practice_history"); 
-    
-    const progressPipeline = [
-      { $match: { userEmail: email, subject: subject } },
-      { $group: { _id: "$chapter", count: { $sum: 1 } } }
-    ];
-    const userProgress = await practiceHistoryCollection.aggregate(progressPipeline).toArray();
+    if (isNestedMode) {
+        // =================================================
+        // 🅰️ NESTED MODE (Group by Chapter -> then Topic)
+        // =================================================
+        
+        // 1. Total Counts Pipeline (Nested)
+        const totalPipeline = [
+            { $match: matchQuery },
+            // First group by unique Chapter+Topic combo
+            { 
+                $group: { 
+                    _id: { chapter: "$chapter", topic: "$topic" }, 
+                    count: { $sum: 1 } 
+                } 
+            },
+            // Then group by Chapter to create the array of topics
+            {
+                $group: {
+                    _id: "$_id.chapter",
+                    chapterTotal: { $sum: "$count" },
+                    topics: { 
+                        $push: { 
+                            name: "$_id.topic", 
+                            total: "$count",
+                            completed: 0 // Initialize as 0
+                        } 
+                    }
+                }
+            }
+        ];
+        const totalCounts = await mcqCollection.aggregate(totalPipeline).toArray();
 
-    // 5. Merge Data
-    const stats = {};
-    
-    // Populate Totals
-    totalCounts.forEach(item => {
-      // item._id is the chapter name
-      if (item._id) { 
-        stats[item._id] = { total: item.count, completed: 0 };
-      }
+        // Initialize Stats Object
+        totalCounts.forEach(item => {
+            if (item._id) {
+                stats[item._id] = { 
+                    total: item.chapterTotal, 
+                    completed: 0, 
+                    topics: item.topics 
+                };
+            }
+        });
+
+        // 2. User Progress Pipeline (Nested)
+        const progressPipeline = [
+            { $match: { userEmail: email, subject: subject } },
+            // Group user history by Chapter+Topic
+            { 
+                $group: { 
+                    _id: { chapter: "$chapter", topic: "$topic" }, 
+                    count: { $sum: 1 } 
+                } 
+            }
+        ];
+        const userProgress = await db.collection("practice_history").aggregate(progressPipeline).toArray();
+
+        // 3. Merge Progress into Stats
+        userProgress.forEach(h => {
+            const chapterName = h._id.chapter;
+            const topicName = h._id.topic;
+            const solvedCount = h.count;
+
+            if (stats[chapterName]) {
+                // Update Chapter Total Completed
+                stats[chapterName].completed += solvedCount;
+
+                // Update Specific Topic Completed
+                const topicObj = stats[chapterName].topics.find(t => t.name === topicName);
+                if (topicObj) {
+                    topicObj.completed = solvedCount;
+                }
+            }
+        });
+
+    } else {
+        // =================================================
+        // 🅱️ STANDARD MODE (Group by Chapter Only)
+        // =================================================
+
+        // 1. Total Counts Pipeline (Standard)
+        const totalPipeline = [
+            { $match: matchQuery }, 
+            { $group: { _id: "$chapter", count: { $sum: 1 } } }
+        ];
+        const totalCounts = await mcqCollection.aggregate(totalPipeline).toArray();
+
+        // Initialize Stats Object
+        totalCounts.forEach(item => {
+            if (item._id) { 
+                stats[item._id] = { total: item.count, completed: 0 };
+            }
+        });
+
+        // 2. User Progress Pipeline (Standard)
+        const progressPipeline = [
+            { $match: { userEmail: email, subject: subject } },
+            { $group: { _id: "$chapter", count: { $sum: 1 } } }
+        ];
+        const userProgress = await db.collection("practice_history").aggregate(progressPipeline).toArray();
+
+        // 3. Merge Progress
+        userProgress.forEach(item => {
+            if (stats[item._id]) {
+                stats[item._id].completed = item.count;
+            }
+        });
+    }
+
+    res.send({
+        stats: stats,
+        groupedBy: isNestedMode ? "nested" : "chapter"
     });
-
-    // Populate Completed (Only if the chapter exists in our filtered totals)
-    userProgress.forEach(item => {
-      if (stats[item._id]) {
-        stats[item._id].completed = item.count;
-      }
-    });
-
-    res.send(stats);
 
   } catch (error) {
     console.error("Error fetching practice stats:", error);
@@ -881,27 +959,32 @@ app.get("/api/practice-stats", verifyFireBaseToken, async (req, res) => {
 
 
 
-// ✅ GET /api/practice-questions
-// Fetches ALL MCQs for a chapter (No Limit) + Resume Index
+// ✅ GET /api/practice-questions (Updated for Topic Support)
 app.get("/api/practice-questions", verifyFireBaseToken, async (req, res) => {
   try {
-    const { subject, chapter } = req.query;
+    // 1. Extract 'topic' from query
+    const { subject, chapter, topic } = req.query; 
     const email = req.decoded.email;
 
     if (!subject || !chapter) {
       return res.status(400).send({ message: "Subject and Chapter required" });
     }
 
-    // 1. Get User Group
+    // 2. Get User Group
     const user = await userCollection.findOne({ email });
     const userGroup = user?.studentProfile?.group;
 
-    // 2. Build Query
+    // 3. Build Query
     const query = {
       subject: subject,
       chapter: chapter,
       questionType: "বহুনির্বাচনি প্রশ্ন"
     };
+
+    // ✅ NEW: If topic is provided (e.g., Bangla 1st), filter by it
+    if (topic) {
+        query.topic = topic;
+    }
 
     // 🔒 Admission Filter Logic
     if (userGroup === "Admission") {
@@ -911,45 +994,45 @@ app.get("/api/practice-questions", verifyFireBaseToken, async (req, res) => {
       ];
     }
 
-    // 3. Fetch ALL Questions
-    // ⚠️ IMPORTANT: We use .sort({ _id: 1 }) instead of random shuffle.
-    // This ensures "Question 10" is always the same question, allowing users to resume.
+    // 4. Fetch Questions (Now filtered by Topic if applicable)
     const questions = await mcqCollection.find(query)
-      .sort({ _id: 1 }) // Fixed order (Oldest to Newest)
-      .toArray();       // ❌ No limit() here, fetches everything
+      .sort({ _id: 1 }) 
+      .toArray();
 
-    // ---------------------------------------------------------
-    // 🔥 NEW: Calculate Stats (Correct vs Wrong vs Total Attempts)
-    // ---------------------------------------------------------
+    // 5. Calculate Stats (Specific to this Chapter OR Topic)
+    
+    // Build the match object for history
+    const historyMatch = { 
+        userEmail: email, 
+        subject: subject, 
+        chapter: chapter 
+    };
+
+    // ✅ NEW: If practicing a topic, only count history for that topic
+    // This ensures "Resume" starts at Q1 for 'Topic A' even if you finished 'Topic B'
+    if (topic) {
+        historyMatch.topic = topic;
+    }
+
     const stats = await db.collection("practice_history").aggregate([
-        { 
-            $match: { 
-                userEmail: email, 
-                subject: subject, 
-                chapter: chapter 
-            } 
-        },
+        { $match: historyMatch },
         { 
             $group: { 
                 _id: null, 
-                // Count total documents found for this chapter
                 totalAttempts: { $sum: 1 }, 
-                // If isCorrect is true, add 1, else add 0
                 totalCorrect: { $sum: { $cond: ["$isCorrect", 1, 0] } },
-                // If isCorrect is false, add 1, else add 0
                 totalWrong: { $sum: { $cond: ["$isCorrect", 0, 1] } } 
             } 
         }
     ]).toArray();
 
-    // Handle case where user has no history yet
     const resultStats = stats.length > 0 ? stats[0] : { totalAttempts: 0, totalCorrect: 0, totalWrong: 0 };
 
     res.send({
         questions: questions,
-        lastIndex: resultStats.totalAttempts, // Where to resume
-        prevCorrect: resultStats.totalCorrect, // For Green Score
-        prevWrong: resultStats.totalWrong      // For Red Score
+        lastIndex: resultStats.totalAttempts, 
+        prevCorrect: resultStats.totalCorrect,
+        prevWrong: resultStats.totalWrong      
     });
 
   } catch (error) {
@@ -959,16 +1042,14 @@ app.get("/api/practice-questions", verifyFireBaseToken, async (req, res) => {
 });
 
 // ✅ POST /api/save-progress
-// Saves a single question attempt
 app.post("/api/save-progress", verifyFireBaseToken, async (req, res) => {
   try {
-    const { questionId, subject, chapter, isCorrect } = req.body;
+    // ✅ Extract 'topic' here
+    const { questionId, subject, chapter, topic, isCorrect } = req.body; 
     const email = req.decoded.email;
 
     const practiceHistory = db.collection("practice_history");
 
-    // Update or Insert (Upsert)
-    // We use userEmail + questionId as the unique composite key
     const filter = { userEmail: email, questionId: questionId };
     
     const updateDoc = {
@@ -977,10 +1058,11 @@ app.post("/api/save-progress", verifyFireBaseToken, async (req, res) => {
         questionId: questionId,
         subject: subject,
         chapter: chapter,
-        isCorrect: isCorrect, // Track accuracy
+        topic: topic || null, // ✅ Save topic (or null if standard chapter)
+        isCorrect: isCorrect, 
         lastAttemptedAt: new Date()
       },
-      $inc: { attempts: 1 } // Count how many times they tried this Q
+      $inc: { attempts: 1 } 
     };
 
     await practiceHistory.updateOne(filter, updateDoc, { upsert: true });
@@ -1033,6 +1115,39 @@ app.patch("/users/update-profile", verifyFireBaseToken, async (req, res) => {
   } catch (error) {
     console.error("Error updating profile:", error);
     res.status(500).send({ message: "Failed to update profile" });
+  }
+});
+
+
+// ✅ GET /api/user-stats
+// Returns total questions solved, total correct, etc.
+app.get("/api/user-stats", verifyFireBaseToken, async (req, res) => {
+  try {
+    const email = req.decoded.email;
+
+    // Aggregate entire practice history for this user
+    const stats = await db.collection("practice_history").aggregate([
+      { $match: { userEmail: email } },
+      { 
+        $group: { 
+          _id: null, 
+          totalSolved: { $sum: 1 },
+          totalCorrect: { $sum: { $cond: ["$isCorrect", 1, 0] } }
+        } 
+      }
+    ]).toArray();
+
+    const data = stats[0] || { totalSolved: 0, totalCorrect: 0 };
+
+    res.send({
+      totalSolved: data.totalSolved,
+      totalCorrect: data.totalCorrect,
+      // You can add logic for 'Daily Goal' or 'Time Spent' if you track timestamps
+    });
+
+  } catch (error) {
+    console.error("Error fetching user stats:", error);
+    res.status(500).send({ message: "Server Error" });
   }
 });
 
