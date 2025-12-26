@@ -53,6 +53,8 @@ async function run() {
     const usersQuestionsCollection = db.collection("collections");
     const onlineExamCollections = db.collection("online_exam_collections");
     const examResponsesCollection = db.collection("online_exam_response_collections");
+    const modelTestsCollection = db.collection("model_tests");
+    const examResultsCollection = db.collection("model_tests_results");
     
     // Firebase Token Verification Middleware
     const verifyFireBaseToken = async (req, res, next) => {
@@ -1150,6 +1152,330 @@ app.get("/api/user-stats", verifyFireBaseToken, async (req, res) => {
     res.status(500).send({ message: "Server Error" });
   }
 });
+
+
+
+// ✅ POST /api/model-tests
+// Description: Create a new Model Test / Exam
+app.post("/api/model-tests", verifyFireBaseToken, verifyAdmin, async (req, res) => {
+  try {
+    const examData = req.body;
+
+    // 1. Basic Validation
+    if (!examData.title || !examData.group || !examData.questionIds || examData.questionIds.length === 0) {
+      return res.status(400).send({ message: "Missing required fields or no questions selected." });
+    }
+
+    // 2. Construct the Exam Object
+    // We explicitly map fields to ensure data types are correct
+    const newExam = {
+      title: examData.title,
+      subtitle: examData.subtitle || "",
+      
+      // Audience & Type
+      group: examData.group,         // e.g., "HSC", "Class 1 to 8"
+      division: examData.division,   // e.g., "Science", "Common"
+      class: examData.class || null, // e.g., "Class 9" (Specific to Class 1-8 group)
+      type: examData.type,           // e.g., "subject-wise-test"
+      
+      // Hierarchy / Tags
+      examClass: examData.examClass || null, // e.g., "HSC - 1st Year" (Specific to SSC/HSC)
+      subject: examData.subject || null,
+      chapter: examData.chapter || null,
+      topic: examData.topic || null,
+
+      // Metadata (Specific to Type)
+      board: examData.board || null,
+      institute: examData.institute || null,
+      year: examData.year || null,
+
+      // Scheduling & Grading
+      startTime: new Date(examData.startTime), // Store as ISO Date Object
+      endTime: new Date(examData.endTime),     // Store as ISO Date Object
+      duration: parseInt(examData.duration) || 0,
+      totalMarks: parseInt(examData.totalMarks) || 0,
+
+      // Questions (Convert String IDs to ObjectIds for database references)
+      questionIds: examData.questionIds.map((id) => new ObjectId(id)),
+      questionCount: parseInt(examData.questionCount) || 0,
+
+      // System Meta
+      status: "active", // active, archived, draft
+      createdAt: new Date(),
+    };
+
+    // 3. Insert into Database
+    const result = await modelTestsCollection.insertOne(newExam);
+
+    res.send({ success: true, insertedId: result.insertedId, message: "Exam created successfully" });
+
+  } catch (error) {
+    console.error("Error creating model test:", error);
+    res.status(500).send({ message: "Internal Server Error" });
+  }
+});
+
+
+
+
+// ✅ API 1: Get Exam List (Pure Data, No User Logic)
+// Matches route: /api/model-tests
+app.get("/api/student/model-tests", verifyFireBaseToken, async (req, res) => {
+  try {
+    const { group, type } = req.query;
+    let query = { status: "active" };
+
+    if (group) query.group = group;
+    if (type) query.type = type;
+
+    const tests = await modelTestsCollection.find(query)
+      .sort({ startTime: 1 })
+      .toArray();
+
+    res.send(tests);
+  } catch (error) {
+    console.error("Error fetching exams:", error);
+    res.status(500).send({ message: "Failed to fetch exams" });
+  }
+});
+
+// ✅ API 2: Get My Attempts (User Specific)
+// Matches route: /api/student/exam-attempts
+app.get("/api/student/exam-attempts", verifyFireBaseToken, async (req, res) => {
+  try {
+    if (!req.decoded || !req.decoded.email) {
+        return res.status(401).send({ message: "User not authenticated" });
+    }
+    const studentId = req.decoded.email;
+
+    // Return only examId and the result ID
+    const attempts = await examResultsCollection.find({ studentId: studentId })
+        .project({ examId: 1, _id: 1 }) 
+        .toArray();
+
+    res.send(attempts);
+  } catch (error) {
+    console.error("Error fetching attempts:", error);
+    res.status(500).send({ message: "Failed to fetch attempts" });
+  }
+});
+
+
+
+// ✅ 1. GET Single Exam Meta (For Header info)
+app.get("/api/model-tests/:id", verifyFireBaseToken, async (req, res) => {
+    try {
+        const id = req.params.id;
+        const exam = await modelTestsCollection.findOne({ _id: new ObjectId(id) });
+        res.send(exam);
+    } catch (error) {
+        res.status(500).send({ message: "Failed to fetch exam" });
+    }
+});
+
+// ✅ 2. POST Questions for Exam (For Security, fetch specific IDs only)
+// Why POST? Because GET URLs have length limits, and an exam might have 100 question IDs.
+app.post("/api/model-tests/questions", verifyFireBaseToken, async (req, res) => {
+    try {
+        const { questionIds } = req.body;
+        // Convert string IDs to ObjectIds
+        const objectIds = questionIds.map(id => new ObjectId(id));
+        
+        // Fetch questions but EXCLUDE the correct answer (security)
+        const questions = await mcqCollection.find({ _id: { $in: objectIds } })
+            .project({ correctOptionIndices: 0, solution: 0 }) // HIDE ANSWERS
+            .toArray();
+            
+        // Preserve order of questions as defined in the exam
+        // (Optional: mongo might return them in different order)
+        const sortedQuestions = objectIds.map(id => questions.find(q => q._id.equals(id))).filter(q => q);
+
+        res.send(sortedQuestions);
+    } catch (error) {
+        res.status(500).send({ message: "Failed to load questions" });
+    }
+});
+
+const { ObjectId } = require("mongodb"); // Ensure this is imported
+
+// ✅ 3. POST Submit Exam (Fixed for MongoDB Driver v5+)
+app.post("/api/exam-results/submit", verifyFireBaseToken, async (req, res) => {
+    try {
+        const { examId, studentId, answers, timeTaken } = req.body;
+
+        // 1. Validation check
+        if (!examId || !studentId) {
+            return res.status(400).send({ message: "Missing examId or studentId" });
+        }
+
+        // 2. Fetch the Exam Metadata
+        const exam = await modelTestsCollection.findOne({ _id: new ObjectId(examId) });
+        if (!exam) return res.status(404).send({ message: "Exam not found" });
+
+        // 3. Fetch Original Questions
+        const questionIds = exam.questionIds.map(id => new ObjectId(id));
+        const originalQuestions = await mcqCollection.find({ _id: { $in: questionIds } }).toArray();
+
+        // 4. Grading Logic
+        let correctCount = 0;
+        let wrongCount = 0;
+        let totalScore = 0;
+        let answeredCount = 0;
+
+        const detailedResult = [];
+
+        originalQuestions.forEach(q => {
+            const qIdStr = q._id.toString();
+            const userAnsIndex = answers[qIdStr];
+            
+            let status = "skipped";
+            const mark = parseFloat(q.priceing?.mark) || 1;
+            
+            // Ensure correct index is a number
+            const correctAnswer = parseInt(q.correctOptionIndices);
+
+            if (userAnsIndex !== undefined && userAnsIndex !== null) {
+                answeredCount++;
+                if (userAnsIndex === correctAnswer) {
+                    correctCount++;
+                    totalScore += mark;
+                    status = "correct";
+                } else {
+                    wrongCount++;
+                    status = "wrong";
+                }
+            }
+
+            detailedResult.push({
+                questionId: q._id,
+                userSelected: userAnsIndex,
+                correctAnswer: correctAnswer,
+                status: status,
+                markObtained: status === "correct" ? mark : 0
+            });
+        });
+
+        // 5. Prepare Database Operation
+        const filter = { 
+            examId: new ObjectId(examId), 
+            studentId: studentId 
+        };
+
+        const updateDoc = {
+            $set: {
+                examTitle: exam.title,
+                totalQuestions: originalQuestions.length,
+                totalMarks: exam.totalMarks,
+                obtainedMarks: totalScore,
+                correctCount,
+                wrongCount,
+                skippedCount: originalQuestions.length - answeredCount,
+                timeTaken: timeTaken,
+                submittedAt: new Date(),
+                details: detailedResult
+            },
+            $inc: { attemptCount: 1 },
+            $setOnInsert: {
+                createdAt: new Date()
+            }
+        };
+
+        // 6. Execute Upsert
+        // includeResultMetadata: true is REQUIRED in newer drivers to get 'lastErrorObject' and 'value' wrapper
+        const result = await examResultsCollection.findOneAndUpdate(
+            filter,
+            updateDoc,
+            { 
+                upsert: true, 
+                returnDocument: 'after',
+                includeResultMetadata: true 
+            }
+        );
+
+        // Handle Driver Differences (value vs directly returned doc)
+        // In some drivers 'result' is the doc, in others 'result.value' is the doc.
+        const doc = result.value || result; 
+
+        // 7. Update Participant Count (Only if it was a NEW insertion)
+        // updatedExisting is true if we updated a record, false if we inserted a new one
+        const isNewEntry = result.lastErrorObject ? !result.lastErrorObject.updatedExisting : false;
+
+        if (isNewEntry) {
+            await modelTestsCollection.updateOne(
+                { _id: new ObjectId(examId) },
+                { $inc: { participants: 1 } }
+            );
+        }
+
+        // 8. Send Response
+        res.send({ 
+            success: true, 
+            resultId: doc._id, 
+            score: totalScore 
+        });
+
+    } catch (error) {
+        console.error("Submission Error Details:", error); // Check your server terminal for this log
+        res.status(500).send({ message: "Failed to submit exam", error: error.message });
+    }
+});
+
+
+
+
+
+// ✅ 1. GET Full Result with Question Details (For Solution Page)
+app.get("/api/exam-results/:resultId", verifyFireBaseToken, async (req, res) => {
+  try {
+    const resultId = req.params.resultId;
+
+    // A. Fetch the Result Document
+    const result = await examResultsCollection.findOne({ _id: new ObjectId(resultId) });
+    if (!result) return res.status(404).send({ message: "Result not found" });
+
+    // B. Fetch Original Questions to show text/solutions
+    // We extract all question IDs from the result details
+    const questionIds = result.details.map(d => d.questionId);
+    
+    const questions = await mcqCollection.find({ _id: { $in: questionIds } })
+        .project({ question: 1, options: 1, solution: 1, explanation: 1 }) // Fetch text & solution
+        .toArray();
+
+    // C. Calculate Rank (On the fly)
+    // Count how many people scored HIGHER than this student for this specific exam
+    const rank = await examResultsCollection.countDocuments({
+        examId: result.examId,
+        $or: [
+            { obtainedMarks: { $gt: result.obtainedMarks } },
+            { obtainedMarks: result.obtainedMarks, timeTaken: { $lt: result.timeTaken } }
+        ]
+    }) + 1;
+
+    res.send({ result, questions, rank });
+
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: "Server Error" });
+  }
+});
+
+// ✅ 2. GET Leaderboard for an Exam
+app.get("/api/leaderboard/:examId", verifyFireBaseToken, async (req, res) => {
+  try {
+    const examId = req.params.examId;
+    
+    const leaderboard = await examResultsCollection.find({ examId: new ObjectId(examId) })
+        .sort({ obtainedMarks: -1, timeTaken: 1 }) // Higher marks first, less time second
+        .limit(50) // Top 50
+        .project({ studentId: 1, obtainedMarks: 1, timeTaken: 1, submittedAt: 1 }) // Only show necessary info
+        .toArray();
+
+    res.send(leaderboard);
+  } catch (error) {
+    res.status(500).send({ message: "Error fetching leaderboard" });
+  }
+});
+
 
 
     // Send a ping to confirm a successful connection
