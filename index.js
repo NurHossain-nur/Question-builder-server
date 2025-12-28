@@ -55,6 +55,7 @@ async function run() {
     const examResponsesCollection = db.collection("online_exam_response_collections");
     const modelTestsCollection = db.collection("model_tests");
     const examResultsCollection = db.collection("model_tests_results");
+    const paymentCollection = db.collection("payment_requests");
     
     // Firebase Token Verification Middleware
     const verifyFireBaseToken = async (req, res, next) => {
@@ -1474,6 +1475,166 @@ app.get("/api/leaderboard/:examId", verifyFireBaseToken, async (req, res) => {
   } catch (error) {
     res.status(500).send({ message: "Error fetching leaderboard" });
   }
+});
+
+
+
+
+
+
+
+
+// --- 1. POST: User Sends Payment Request ---
+app.post("/api/payment/request",verifyFireBaseToken, async (req, res) => {
+  const paymentData = req.body;
+  
+  // Basic validation
+  if (!paymentData.email || !paymentData.transactionId) {
+    return res.status(400).send({ message: "Invalid data" });
+  }
+
+  // Add server-side fields
+  const doc = {
+    ...paymentData,
+    status: "pending", // pending, approved, rejected
+    submittedAt: new Date(),
+  };
+
+  const result = await paymentCollection.insertOne(doc);
+  res.send(result);
+});
+
+// --- 2. GET: Admin Views All Pending Requests ---
+// ⚠️ IMPORTANT: Add verifyToken and verifyAdmin middleware here
+app.get("/api/admin/payment-requests", verifyFireBaseToken, verifyAdmin, async (req, res) => {
+  const query = { status: "pending" }; // Or remove query to see history
+  // Sort by newest first
+  const result = await paymentCollection.find(query).sort({ submittedAt: -1 }).toArray();
+  res.send(result);
+});
+
+// --- 3. PATCH: Admin Approves Request & Updates User Subscription ---
+app.patch("/api/admin/approve-payment/:id", verifyFireBaseToken, verifyAdmin, async (req, res) => {
+  const id = req.params.id;
+  const { email, planType, durationDays } = req.body;
+
+  // 1. Validate Inputs
+  const days = parseInt(durationDays);
+  if (isNaN(days) || !email || !planType) {
+      return res.status(400).send({ success: false, message: "Invalid duration, email, or plan type." });
+  }
+
+  try {
+      // 2. Find User
+      const user = await userCollection.findOne({ email: email });
+      if (!user) {
+          return res.status(404).send({ success: false, message: "User not found." });
+      }
+
+      // 3. Helper Function to Calculate New Expiry
+      const calculateExpiry = (currentSub) => {
+          const now = new Date();
+          let newExpiry = new Date();
+          
+          if (currentSub && currentSub.isActive) {
+              const currentExpiryDate = new Date(currentSub.expiryDate);
+              // Extend if valid, otherwise start fresh
+              if (currentExpiryDate > now) {
+                  newExpiry = new Date(currentExpiryDate.getTime() + (days * 24 * 60 * 60 * 1000));
+              } else {
+                  newExpiry = new Date(now.getTime() + (days * 24 * 60 * 60 * 1000));
+              }
+          } else {
+              // New subscription
+              newExpiry = new Date(now.getTime() + (days * 24 * 60 * 60 * 1000));
+          }
+          return newExpiry;
+      };
+
+      // 4. Prepare User Update Object
+      let userUpdate = {};
+      let finalExpiryDate = new Date(); // To save in payment log
+
+      if (planType === 'combo') {
+          // ✅ COMBO LOGIC: Update BOTH Practice and ModelTest
+          const practiceExpiry = calculateExpiry(user.subscriptions?.practice);
+          const modelTestExpiry = calculateExpiry(user.subscriptions?.modelTest);
+          
+          // Use the later date for the payment log (usually they are same)
+          finalExpiryDate = practiceExpiry > modelTestExpiry ? practiceExpiry : modelTestExpiry;
+
+          userUpdate = {
+              $set: {
+                  'subscriptions.practice.isActive': true,
+                  'subscriptions.practice.expiryDate': practiceExpiry,
+                  'subscriptions.practice.lastPaymentId': id,
+                  
+                  'subscriptions.modelTest.isActive': true,
+                  'subscriptions.modelTest.expiryDate': modelTestExpiry,
+                  'subscriptions.modelTest.lastPaymentId': id
+              }
+          };
+      } else {
+          // ✅ SINGLE PLAN LOGIC (practice OR modelTest)
+          const newExpiry = calculateExpiry(user.subscriptions?.[planType]);
+          finalExpiryDate = newExpiry;
+
+          userUpdate = {
+              $set: {
+                  [`subscriptions.${planType}.isActive`]: true,
+                  [`subscriptions.${planType}.expiryDate`]: newExpiry,
+                  [`subscriptions.${planType}.lastPaymentId`]: id
+              }
+          };
+      }
+
+      // 5. Update User Collection
+      const userFilter = { email: email };
+      const userUpdateResult = await userCollection.updateOne(userFilter, userUpdate, { upsert: true });
+
+      // 6. Update Payment Collection
+      const paymentFilter = { _id: new ObjectId(id) };
+      const paymentUpdate = {
+        $set: { 
+          status: "approved",
+          approvedAt: new Date(),
+          expiryDate: finalExpiryDate
+        }
+      };
+      const paymentUpdateResult = await paymentCollection.updateOne(paymentFilter, paymentUpdate);
+
+      // 7. Send Response
+      if(paymentUpdateResult.modifiedCount > 0 || userUpdateResult.modifiedCount > 0 || userUpdateResult.upsertedCount > 0){
+          res.send({ success: true, message: "Subscription activated successfully" });
+      } else {
+          res.status(200).send({ success: true, message: "Subscription already active or no changes needed." });
+      }
+
+  } catch (error) {
+      console.error("Approval Error:", error);
+      res.status(500).send({ success: false, message: "Internal Server Error" });
+  }
+});
+
+// --- 4. PATCH: Admin Rejects Request (Optional) ---
+app.patch("/api/admin/reject-payment/:id", verifyFireBaseToken, verifyAdmin, async (req, res) => {
+    const id = req.params.id;
+    const filter = { _id: new ObjectId(id) };
+    const update = { $set: { status: "rejected" } };
+    const result = await paymentCollection.updateOne(filter, update);
+    res.send(result);
+});
+
+
+// GET: My Payment History
+app.get("/api/payment/history", verifyFireBaseToken, async (req, res) => {
+  const email = req.query.email;
+  // Security check: ensure requesting user matches token user
+  if (req.decoded.email !== email) {
+    return res.status(403).send({ message: "Forbidden access" });
+  }
+  const result = await paymentCollection.find({ email: email }).sort({ requestDate: -1 }).toArray();
+  res.send(result);
 });
 
 
