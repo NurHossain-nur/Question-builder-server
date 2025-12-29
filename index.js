@@ -1516,12 +1516,15 @@ app.get("/api/admin/payment-requests", verifyFireBaseToken, verifyAdmin, async (
 // --- 3. PATCH: Admin Approves Request & Updates User Subscription ---
 app.patch("/api/admin/approve-payment/:id", verifyFireBaseToken, verifyAdmin, async (req, res) => {
   const id = req.params.id;
-  const { email, planType, durationDays, questionLimit } = req.body;
+  const { email, planType, durationDays, questionLimit, amount } = req.body;
 
-  // 1. Validate Inputs
+  // Only check for valid 'days' if the plan is NOT a recharge
   const days = parseInt(durationDays);
-  if (isNaN(days) || !email || !planType) {
-      return res.status(400).send({ success: false, message: "Invalid duration, email, or plan type." });
+  if (!email || !planType) {
+      return res.status(400).send({ success: false, message: "Invalid email or plan type." });
+  }
+  if (planType !== 'recharge' && isNaN(days)) {
+      return res.status(400).send({ success: false, message: "Invalid duration for subscription." });
   }
 
   try {
@@ -1553,8 +1556,17 @@ app.patch("/api/admin/approve-payment/:id", verifyFireBaseToken, verifyAdmin, as
       let userUpdate = {};
       let finalExpiryDate = new Date(); 
 
-      // ✅ FIXED LOGIC STRUCTURE: Use if...else if...else
-      if (planType === 'teacher') {
+      // ✅ UPDATE 3: Insert Recharge Logic Here
+      if (planType === 'recharge') {
+          // ⚡ WALLET RECHARGE LOGIC
+          // We don't set an expiry date for wallet balance, so we just use current date for the payment record
+          finalExpiryDate = new Date(); 
+
+          userUpdate = {
+              $inc: { wallet_balance: parseFloat(amount) } // 
+          };
+      }
+      else if (planType === 'teacher') {
           // 👨‍🏫 TEACHER PLAN
           const teacherExpiry = calculateExpiry(user.subscriptions?.teacher);
           finalExpiryDate = teacherExpiry;
