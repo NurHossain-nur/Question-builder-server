@@ -132,12 +132,19 @@ async function run() {
         if (search) {
           const searchRegex = new RegExp(search, "i");
           query.$or = [
-            { question: searchRegex },
+            // ১. প্রশ্নের টেক্সট খুঁজবে (Dot notation জরুরি)
+            { "question.text": searchRegex },
+            
+            // ২. অপশনের টেক্সট খুঁজবে (MongoDB অটোমেটিক অ্যারের ভেতর খুঁজবে)
+            { "options.text": searchRegex },
+            
+            // ৩. সলিউশন খুঁজবে
+            { "solution.text": searchRegex },
+            { "explanation.text": searchRegex },
             { subject: searchRegex },
             { chapter: searchRegex },
             { topic: searchRegex },
             { tags: searchRegex },
-            { explanation: searchRegex },
           ];
         }
 
