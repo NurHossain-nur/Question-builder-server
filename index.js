@@ -1516,7 +1516,7 @@ app.get("/api/admin/payment-requests", verifyFireBaseToken, verifyAdmin, async (
 // --- 3. PATCH: Admin Approves Request & Updates User Subscription ---
 app.patch("/api/admin/approve-payment/:id", verifyFireBaseToken, verifyAdmin, async (req, res) => {
   const id = req.params.id;
-  const { email, planType, durationDays } = req.body;
+  const { email, planType, durationDays, questionLimit } = req.body;
 
   // 1. Validate Inputs
   const days = parseInt(durationDays);
@@ -1538,14 +1538,12 @@ app.patch("/api/admin/approve-payment/:id", verifyFireBaseToken, verifyAdmin, as
           
           if (currentSub && currentSub.isActive) {
               const currentExpiryDate = new Date(currentSub.expiryDate);
-              // Extend if valid, otherwise start fresh
               if (currentExpiryDate > now) {
                   newExpiry = new Date(currentExpiryDate.getTime() + (days * 24 * 60 * 60 * 1000));
               } else {
                   newExpiry = new Date(now.getTime() + (days * 24 * 60 * 60 * 1000));
               }
           } else {
-              // New subscription
               newExpiry = new Date(now.getTime() + (days * 24 * 60 * 60 * 1000));
           }
           return newExpiry;
@@ -1553,14 +1551,29 @@ app.patch("/api/admin/approve-payment/:id", verifyFireBaseToken, verifyAdmin, as
 
       // 4. Prepare User Update Object
       let userUpdate = {};
-      let finalExpiryDate = new Date(); // To save in payment log
+      let finalExpiryDate = new Date(); 
 
-      if (planType === 'combo') {
-          // ✅ COMBO LOGIC: Update BOTH Practice and ModelTest
+      // ✅ FIXED LOGIC STRUCTURE: Use if...else if...else
+      if (planType === 'teacher') {
+          // 👨‍🏫 TEACHER PLAN
+          const teacherExpiry = calculateExpiry(user.subscriptions?.teacher);
+          finalExpiryDate = teacherExpiry;
+          
+          userUpdate = {
+              $set: {
+                  'subscriptions.teacher.isActive': true,
+                  'subscriptions.teacher.expiryDate': teacherExpiry,
+                  'subscriptions.teacher.questionLimit': parseInt(questionLimit), // ✅ Explicitly saved
+                  'subscriptions.teacher.questionUsed': 0, // Reset usage
+                  'subscriptions.teacher.lastPaymentId': id
+              }
+          };
+      } 
+      else if (planType === 'combo') {
+          // 🎁 COMBO PLAN
           const practiceExpiry = calculateExpiry(user.subscriptions?.practice);
           const modelTestExpiry = calculateExpiry(user.subscriptions?.modelTest);
           
-          // Use the later date for the payment log (usually they are same)
           finalExpiryDate = practiceExpiry > modelTestExpiry ? practiceExpiry : modelTestExpiry;
 
           userUpdate = {
@@ -1574,8 +1587,9 @@ app.patch("/api/admin/approve-payment/:id", verifyFireBaseToken, verifyAdmin, as
                   'subscriptions.modelTest.lastPaymentId': id
               }
           };
-      } else {
-          // ✅ SINGLE PLAN LOGIC (practice OR modelTest)
+      } 
+      else {
+          // ⚡ STANDARD PLAN (practice OR modelTest)
           const newExpiry = calculateExpiry(user.subscriptions?.[planType]);
           finalExpiryDate = newExpiry;
 
@@ -1635,6 +1649,65 @@ app.get("/api/payment/history", verifyFireBaseToken, async (req, res) => {
   }
   const result = await paymentCollection.find({ email: email }).sort({ requestDate: -1 }).toArray();
   res.send(result);
+});
+
+
+
+
+// ✅ DEDUCT QUESTION LIMIT (For Teacher Plans)
+app.patch("/api/users/deduct-question-limit", verifyFireBaseToken, async (req, res) => {
+  const { email, count, details } = req.body;
+
+  try {
+    const user = await userCollection.findOne({ email });
+
+    if (!user || !user.subscriptions?.teacher?.isActive) {
+      return res.status(403).send({ message: "No active teacher subscription" });
+    }
+
+    const sub = user.subscriptions.teacher;
+    const limit = sub.questionLimit;
+    const used = sub.questionUsed || 0;
+
+    // Check Limit (Skip if unlimited i.e., -1)
+    if (limit !== -1 && (used + count > limit)) {
+      return res.status(400).send({ message: "Question limit exceeded for this plan." });
+    }
+
+    // Update Usage
+    const updateResult = await userCollection.updateOne(
+      { email: email },
+      { 
+        $inc: { "subscriptions.teacher.questionUsed": count } 
+      }
+    );
+
+    if (updateResult.modifiedCount > 0) {
+
+      // 📝 LOG TRANSACTION (New Feature)
+      const remaining = limit === -1 ? "Unlimited" : (limit - (used + count));
+      
+      const transaction = {
+        email: email,
+        amount: 0, // কোনো টাকা কাটা হয়নি
+        quotaDeducted: count, // কতগুলো প্রশ্ন কাটা হলো
+        type: "quota_usage", // ট্রানজ্যাকশন টাইপ
+        details: details || { note: "Used for question creation" },
+        remainingQuota: remaining, // অবশিষ্ট কোটা
+        createdAt: new Date().toISOString(),
+      };
+
+      await transactionCollection.insertOne(transaction);
+
+      res.send({ success: true, message: "Limit deducted and logged" });
+    } else {
+      res.status(500).send({ message: "Failed to update limit" });
+    }
+
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: "Internal Server Error" });
+  }
 });
 
 
