@@ -41,6 +41,46 @@ const client = new MongoClient(uri, {
   },
 });
 
+
+/**
+ * Sends a notification (Personal or Global)
+ * @param {object} params - { userId, title, message, type, link }
+ * @param {object} collections - { notificationCollection }
+ */
+const sendNotification = async (params, collections) => {
+    const { userId, title, message, type = 'info', link = null } = params;
+    const { notificationCollection } = collections;
+
+    const notification = {
+        title,
+        message,
+        type, // 'info', 'success', 'warning', 'error', 'global'
+        link, // Optional: Link to redirect user (e.g., to payment history)
+        date: new Date(),
+        isRead: false,
+    };
+
+    if (userId === 'global') {
+        // Global Notification: No specific userId, visible to all
+        notification.target = 'global';
+        delete notification.userId; 
+        // We don't track 'isRead' for global here generally, or handle it differently
+    } else {
+        // Individual Notification
+        notification.userId = userId; // String ID
+        notification.target = 'individual';
+    }
+
+    try {
+        const result = await notificationCollection.insertOne(notification);
+        return { success: true, id: result.insertedId };
+    } catch (error) {
+        console.error("Notification Error:", error);
+        return { success: false, error };
+    }
+};
+
+
 async function run() {
   try {
     // Connect the client to the server	(optional starting in v4.7)
@@ -56,6 +96,7 @@ async function run() {
     const modelTestsCollection = db.collection("model_tests");
     const examResultsCollection = db.collection("model_tests_results");
     const paymentCollection = db.collection("payment_requests");
+    const notificationCollection = db.collection("notifications");
     
     // Firebase Token Verification Middleware
     const verifyFireBaseToken = async (req, res, next) => {
@@ -1304,7 +1345,7 @@ app.post("/api/model-tests/questions", verifyFireBaseToken, async (req, res) => 
     }
 });
 
-const { ObjectId } = require("mongodb"); // Ensure this is imported
+// const { ObjectId } = require("mongodb"); // Ensure this is imported
 
 // ✅ 3. POST Submit Exam (Fixed for MongoDB Driver v5+)
 app.post("/api/exam-results/submit", verifyFireBaseToken, async (req, res) => {
@@ -1507,14 +1548,62 @@ app.post("/api/payment/request",verifyFireBaseToken, async (req, res) => {
     submittedAt: new Date(),
   };
 
-  const result = await paymentCollection.insertOne(doc);
-  res.send(result);
+  try {
+      const result = await paymentCollection.insertOne(doc);
+
+      if (result.insertedId) {
+          
+          // ---------------------------------------------
+          // 1. Notify the User (Confirmation)
+          // ---------------------------------------------
+          const user = await userCollection.findOne({ email: paymentData.email });
+          if (user) {
+              await sendNotification({
+                  userId: user._id.toString(),
+                  title: "Request Submitted ⏳",
+                  message: `Your payment request for ${paymentData.amount} BDT (${paymentData.planType}) has been received.`,
+                  type: "info", 
+                  link: "/profile"
+              }, { notificationCollection });
+          }
+
+          // ---------------------------------------------
+          // 2. ✅ NEW: Notify ALL Admins
+          // ---------------------------------------------
+          const admins = await userCollection.find({ role: 'admin' }).toArray();
+
+          if (admins.length > 0) {
+              // Create a notification promise for each admin
+              const adminNotificationPromises = admins.map(admin => {
+                  return sendNotification({
+                      userId: admin._id.toString(),
+                      title: "New Payment Request 💰",
+                      message: `${paymentData.name || 'A user'} has requested approval for ${paymentData.amount} BDT (${paymentData.planType}). TrxID: ${paymentData.transactionId}`,
+                      type: "warning", // Using 'warning' style (Amber color) to grab attention
+                      link: "/dashboard/payment-requests" // Link to Admin Dashboard
+                  }, { notificationCollection });
+              });
+
+              // Send all admin notifications in parallel
+              await Promise.all(adminNotificationPromises);
+          }
+      }
+
+      res.send(result);
+
+  } catch (error) {
+      console.error("Payment Request Error:", error);
+      res.status(500).send({ message: "Failed to submit request" });
+  }
 });
 
 // --- 2. GET: Admin Views All Pending Requests ---
 // ⚠️ IMPORTANT: Add verifyToken and verifyAdmin middleware here
 app.get("/api/admin/payment-requests", verifyFireBaseToken, verifyAdmin, async (req, res) => {
-  const query = { status: "pending" }; // Or remove query to see history
+  
+  const status = req.query.status || "pending";
+
+  const query = { status: status }; // Or remove query to see history
   // Sort by newest first
   const result = await paymentCollection.find(query).sort({ submittedAt: -1 }).toArray();
   res.send(result);
@@ -1638,7 +1727,27 @@ app.patch("/api/admin/approve-payment/:id", verifyFireBaseToken, verifyAdmin, as
 
       // 7. Send Response
       if(paymentUpdateResult.modifiedCount > 0 || userUpdateResult.modifiedCount > 0 || userUpdateResult.upsertedCount > 0){
-          res.send({ success: true, message: "Subscription activated successfully" });
+          
+        let title = "Subscription Activated! 🎉";
+        let message = `Your ${planType} plan is now active for ${durationDays} days.`;
+
+        // Custom message for Wallet Recharge
+        if (planType === 'recharge') {
+            title = "Wallet Recharged! 💰";
+            message = `Successfully added ৳${amount} to your wallet. Current Balance: ৳${(user.wallet_balance || 0) + parseFloat(amount)}`;
+        }
+
+        // Trigger Notification
+        await sendNotification({
+            userId: user._id.toString(),
+            title: title,
+            message: message,
+            type: "success",
+            link: planType === 'recharge' ? "/profile" : "/profile"
+        }, { notificationCollection });
+            
+            
+        res.send({ success: true, message: "Subscription activated successfully" });
       } else {
           res.status(200).send({ success: true, message: "Subscription already active or no changes needed." });
       }
@@ -1650,12 +1759,53 @@ app.patch("/api/admin/approve-payment/:id", verifyFireBaseToken, verifyAdmin, as
 });
 
 // --- 4. PATCH: Admin Rejects Request (Optional) ---
+// app.patch("/api/admin/reject-payment/:id", verifyFireBaseToken, verifyAdmin, async (req, res) => {
+//     const id = req.params.id;
+//     const filter = { _id: new ObjectId(id) };
+//     const update = { $set: { status: "rejected" } };
+//     const result = await paymentCollection.updateOne(filter, update);
+//     res.send(result);
+// });
+
+
 app.patch("/api/admin/reject-payment/:id", verifyFireBaseToken, verifyAdmin, async (req, res) => {
     const id = req.params.id;
     const filter = { _id: new ObjectId(id) };
-    const update = { $set: { status: "rejected" } };
-    const result = await paymentCollection.updateOne(filter, update);
-    res.send(result);
+
+    try {
+        // 1. Fetch the request details FIRST (to get user info)
+        const paymentRequest = await paymentCollection.findOne(filter);
+        
+        if (!paymentRequest) {
+            return res.status(404).send({ success: false, message: "Request not found" });
+        }
+
+        // 2. Reject the request
+        const updateResult = await paymentCollection.updateOne(filter, { 
+            $set: { status: "rejected" } 
+        });
+
+        // ✅ NEW: Find User and Send Notification
+        if (updateResult.modifiedCount > 0) {
+            const user = await userCollection.findOne({ email: paymentRequest.email });
+            
+            if (user) {
+                await sendNotification({
+                    userId: user._id.toString(),
+                    title: "Payment Rejected ❌",
+                    message: `Your payment request for ${paymentRequest.amount} BDT (${paymentRequest.planType}) was rejected. Please check your transaction ID and try again.`,
+                    type: "error",
+                    link: "/profile"
+                }, { notificationCollection });
+            }
+        }
+
+        res.send(updateResult);
+
+    } catch (error) {
+        console.error("Reject Error:", error);
+        res.status(500).send({ success: false });
+    }
 });
 
 
@@ -1729,6 +1879,152 @@ app.patch("/api/users/deduct-question-limit", verifyFireBaseToken, async (req, r
   }
 });
 
+
+
+
+// GET: Fetch all users with subscription details
+app.get("/api/admin/subscription-status", verifyFireBaseToken, verifyAdmin, async (req, res) => {
+    try {
+        // We project only necessary fields to keep it fast
+        const result = await userCollection.find({}, {
+            projection: {
+                name: 1,
+                email: 1,
+                phone: 1, // Ensure you save phone in user profile
+                wallet_balance: 1,
+                subscriptions: 1, // Contains teacher, practice, etc.
+                role: 1
+            }
+        }).toArray();
+
+        // Optional: Filter out admins if you only want students
+        const subscribers = result.filter(u => u.role !== 'admin');
+
+        res.send(subscribers);
+    } catch (error) {
+        console.error(error);
+        res.status(500).send({ message: "Failed to fetch subscription data" });
+    }
+});
+
+
+
+// ✅ 1. POST: Send Notification (Called by SubscriptionManager frontend)
+app.post("/api/admin/send-notification", verifyFireBaseToken, verifyAdmin, async (req, res) => {
+    const { userId, title, message, isGlobal, type } = req.body;
+
+    // Use the Helper Function
+    const result = await sendNotification({
+        userId: isGlobal ? 'global' : userId,
+        title: req.body.subject || title, // Handle 'subject' from frontend
+        message: req.body.body || message, // Handle 'body' from frontend
+        type:  type, // Use 'global' type for global notifs
+        link: req.body.link || null // Optional link for notification
+      }, { notificationCollection });
+
+    if(result.success) {
+        res.send({ success: true, message: "Notification sent!" });
+    } else {
+        res.status(500).send({ success: false });
+    }
+});
+
+// ✅ 2. GET: Fetch Notifications (Hybrid: Personal + Global)
+app.get("/api/notifications", verifyFireBaseToken, async (req, res) => {
+    const email = req.decoded.email;
+    
+    // Find User to get ID
+    const user = await userCollection.findOne({ email: email });
+    if(!user) return res.send([]);
+
+    const userId = user._id.toString();
+
+    // 1. Fetch Personal Notifications
+    const personal = await notificationCollection
+        .find({ userId: userId })
+        .sort({ date: -1 })
+        .limit(20)
+        .toArray();
+
+    // 2. Fetch Global Notifications (Last 5)
+    // Note: You might want a logic to hide global notifs the user has "cleared", 
+    // but typically global announcements persist for a while.
+    const global = await notificationCollection
+        .find({ target: 'global' })
+        .sort({ date: -1 })
+        .limit(5)
+        .toArray();
+
+    // 3. Merge & Sort by Date (Newest first)
+    const allNotifications = [...personal, ...global]
+        .sort((a, b) => new Date(b.date) - new Date(a.date));
+
+    res.send(allNotifications);
+});
+
+// ✅ 3. PATCH: Mark as Read
+app.patch("/api/notifications/read/:id", verifyFireBaseToken, async (req, res) => {
+    const id = req.params.id;
+    await notificationCollection.updateOne(
+        { _id: new ObjectId(id) },
+        { $set: { isRead: true } }
+    );
+    res.send({ success: true });
+});
+
+
+
+
+// ✅ DELETE: Remove a global notification
+app.delete("/api/admin/global-notification/:id", verifyFireBaseToken, verifyAdmin, async (req, res) => {
+    try {
+        const id = req.params.id;
+        const result = await notificationCollection.deleteOne({ _id: new ObjectId(id) });
+        res.send(result);
+    } catch (error) {
+        res.status(500).send({ message: "Error deleting notification" });
+    }
+});
+
+
+// ✅ GET: Fetch ALL notifications (Global + Individual) for Admin
+app.get("/api/admin/all-notifications", verifyFireBaseToken, verifyAdmin, async (req, res) => {
+    try {
+        const filter = req.query.type === 'global' ? { target: 'global' } : {};
+        
+        // Fetch notifications sorted by newest
+        // Limit to 100 to prevent browser crash
+        const notifications = await notificationCollection
+            .find(filter)
+            .sort({ date: -1 })
+            .limit(100) 
+            .toArray();
+
+        // Optional: If you stored userId but not email, you might want to fetch user details here
+        // But for performance, it's better to just show userId or store email in notification initially.
+        // Assuming we just show the raw data for now.
+
+        res.send(notifications);
+    } catch (error) {
+        res.status(500).send({ message: "Error fetching notifications" });
+    }
+});
+
+// ✅ DELETE: Automated Cleanup (Delete notifications older than 30 days)
+app.delete("/api/admin/notifications/cleanup", verifyFireBaseToken, verifyAdmin, async (req, res) => {
+    try {
+        const thirtyDaysAgo = new Date();
+        thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+
+        const result = await notificationCollection.deleteMany({
+            date: { $lt: thirtyDaysAgo }
+        });
+
+        res.send({ success: true, deletedCount: result.deletedCount });
+    } catch (error) {
+        res.status(500).send({ message: "Cleanup failed" });
+    }
+});
 
 
     // Send a ping to confirm a successful connection
