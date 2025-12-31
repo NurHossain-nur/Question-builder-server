@@ -1719,14 +1719,40 @@ app.patch("/api/admin/approve-payment/:id", verifyFireBaseToken, verifyAdmin, as
       }
       else if (planType === 'teacher') {
           // 👨‍🏫 TEACHER PLAN
-          const teacherExpiry = calculateExpiry(user.subscriptions?.teacher);
-          finalExpiryDate = teacherExpiry;
+          // 👨‍🏫 TEACHER PLAN
+          const currentSub = user.subscriptions?.teacher;
+          const teacherExpiry = calculateExpiry(currentSub);
+          
+          // 1. Calculate Remaining Questions from previous plan
+          let previousRemaining = 0;
+          
+          // Only check remaining if the plan is currently active
+          if (currentSub && currentSub.isActive) {
+              const oldLimit = currentSub.questionLimit || 0;
+              const oldUsed = currentSub.questionUsed || 0;
+              
+              // If old plan was NOT unlimited (-1), calculate what's left
+              if (oldLimit !== -1) {
+                  previousRemaining = Math.max(0, oldLimit - oldUsed);
+              }
+          }
+
+          const newPackLimit = parseInt(questionLimit);
+          let finalLimit = 0;
+
+          // 2. Logic: If New Pack is Unlimited (-1) OR Old was Unlimited, the result is Unlimited (-1)
+          if (newPackLimit === -1 || (currentSub?.questionLimit === -1 && currentSub?.isActive)) {
+              finalLimit = -1; 
+          } else {
+              // Otherwise: Add Remaining + New
+              finalLimit = previousRemaining + newPackLimit;
+          }
           
           userUpdate = {
               $set: {
                   'subscriptions.teacher.isActive': true,
                   'subscriptions.teacher.expiryDate': teacherExpiry,
-                  'subscriptions.teacher.questionLimit': parseInt(questionLimit), // ✅ Explicitly saved
+                  'subscriptions.teacher.questionLimit': finalLimit, // ✅ Explicitly saved
                   'subscriptions.teacher.questionUsed': 0, // Reset usage
                   'subscriptions.teacher.lastPaymentId': id
               }
@@ -2249,6 +2275,151 @@ app.get("/api/my-referrals/:referralCode", async (req, res) => {
     } catch (error) {
         console.error("Referral Stats Error:", error);
         res.status(500).send([]);
+    }
+});
+
+
+
+
+
+// POST: Pay with Wallet (Instant Purchase)
+app.post("/api/payment/pay-with-wallet", verifyFireBaseToken, async (req, res) => {
+    const { email, amount, planType, durationDays, questionLimit } = req.body;
+    const price = parseFloat(amount);
+    const days = parseInt(durationDays);
+
+    try {
+        const user = await userCollection.findOne({ email });
+        
+        // 1. Validate User & Balance
+        if (!user) return res.status(404).send({ success: false, message: "User not found" });
+        if ((user.wallet_balance || 0) < price) {
+            return res.status(400).send({ success: false, message: "Insufficient wallet balance" });
+        }
+        if ((user.wallet_balance || 0) < 50) {
+             return res.status(400).send({ success: false, message: "Minimum 50 TK balance required to use wallet." });
+        }
+
+        // 2. Helper Function: Calculate Expiry (Exact match with Admin Route)
+        const calculateExpiry = (currentSub) => {
+            const now = new Date();
+            let newExpiry = new Date();
+            
+            if (currentSub && currentSub.isActive) {
+                const currentExpiryDate = new Date(currentSub.expiryDate);
+                // Extend if currently active, otherwise start from now
+                if (currentExpiryDate > now) {
+                    newExpiry = new Date(currentExpiryDate.getTime() + (days * 24 * 60 * 60 * 1000));
+                } else {
+                    newExpiry = new Date(now.getTime() + (days * 24 * 60 * 60 * 1000));
+                }
+            } else {
+                newExpiry = new Date(now.getTime() + (days * 24 * 60 * 60 * 1000));
+            }
+            return newExpiry;
+        };
+
+        // ⚡ CRITICAL STEP: Generate a specific ID for this transaction
+        const transactionId = new ObjectId();
+
+        // 3. Prepare Update Object
+        let userUpdate = { $inc: { wallet_balance: -price } }; // Deduct Balance
+        let updateSet = {};
+
+        // 🟢 MATCHING ADMIN LOGIC FOR PLAN TYPES
+        if (planType === 'teacher') {
+            
+            const currentSub = user.subscriptions?.teacher;
+            const teacherExpiry = calculateExpiry(currentSub);
+
+            // A. Calculate Previous Remaining
+            let previousRemaining = 0;
+            if (currentSub && currentSub.isActive) {
+                const oldLimit = currentSub.questionLimit || 0;
+                const oldUsed = currentSub.questionUsed || 0;
+                if (oldLimit !== -1) {
+                    previousRemaining = Math.max(0, oldLimit - oldUsed);
+                }
+            }
+
+            // B. Calculate Final Limit
+            const newPackLimit = parseInt(questionLimit);
+            let finalLimit = 0;
+
+            if (newPackLimit === -1 || (currentSub?.questionLimit === -1 && currentSub?.isActive)) {
+                finalLimit = -1; // Unlimited
+            } else {
+                finalLimit = previousRemaining + newPackLimit; // Add remaining + new
+            }
+
+            updateSet = {
+                'subscriptions.teacher.isActive': true,
+                'subscriptions.teacher.expiryDate': teacherExpiry,
+                'subscriptions.teacher.questionLimit': finalLimit, // ✅ Explicitly saved
+                'subscriptions.teacher.questionUsed': 0, // Reset usage
+                'subscriptions.teacher.lastPaymentId': transactionId.toString()
+            };
+        } 
+        else if (planType === 'combo') {
+            const practiceExpiry = calculateExpiry(user.subscriptions?.practice);
+            const modelTestExpiry = calculateExpiry(user.subscriptions?.modelTest);
+            updateSet = {
+                'subscriptions.practice.isActive': true,
+                'subscriptions.practice.expiryDate': practiceExpiry,
+                'subscriptions.practice.lastPaymentId': transactionId.toString(),
+
+                'subscriptions.modelTest.isActive': true,
+                'subscriptions.modelTest.expiryDate': modelTestExpiry,
+                'subscriptions.modelTest.lastPaymentId': transactionId.toString()
+            };
+        } 
+        else {
+            // Standard (practice or modelTest)
+            const newExpiry = calculateExpiry(user.subscriptions?.[planType]);
+            updateSet = {
+                [`subscriptions.${planType}.isActive`]: true,
+                [`subscriptions.${planType}.expiryDate`]: newExpiry,
+                [`subscriptions.${planType}.lastPaymentId`]: transactionId.toString()
+            };
+        }
+
+        // Merge logic
+        userUpdate.$set = updateSet;
+
+        // 4. Update Database (Atomic Operation)
+        await userCollection.updateOne({ email }, userUpdate);
+
+        // 5. Log Transaction
+        await transactionCollection.insertOne({
+            _id: transactionId,
+            userId: user._id.toString(),
+            email,
+            amount: price,
+            type: "purchase", // Money OUT
+            details: { 
+                collectionName: `${planType} Plan Purchase (Wallet)`,
+                description: `Activated ${planType} plan for ${days} days` 
+            },
+            balanceAfter: (user.wallet_balance - price),
+            createdAt: new Date()
+        });
+
+        // 6. Send Notification
+        await notificationCollection.insertOne({
+            userId: user._id.toString(),
+            title: "Plan Activated! 🚀",
+            message: `Successfully purchased ${planType} plan using Wallet Balance.`,
+            type: "success",
+            link: "/profile",
+            date: new Date(),
+            isRead: false
+        });
+
+        res.send({ success: true, message: "Plan activated successfully" });
+
+    } catch (err) {
+        console.error("Wallet Payment Error:", err);
+        res.status(500).send({ success: false, message: "Server error" });
     }
 });
 
