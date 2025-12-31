@@ -749,6 +749,59 @@ app.get("/transactions", verifyFireBaseToken, async (req, res) => {
 });
 
 
+// POST: Save a new transaction
+app.post("/transactions", async (req, res) => {
+    try {
+        const transaction = req.body;
+        
+        // Basic validation
+        if (!transaction.email || !transaction.amount) {
+            return res.status(400).send({ message: "Invalid transaction data" });
+        }
+
+        const result = await transactionCollection.insertOne(transaction);
+        // 2. ✅ NEW: Send Notification if Saved Successfully
+        if (result.insertedId && transaction.userId) {
+            
+            let title = "Transaction Alert 🔔";
+            let message = `Transaction of ${transaction.amount} BDT successful.`;
+            let type = "info";
+
+            // Customize message based on category (from your frontend logic)
+            if (transaction.details?.category === 'welcome_bonus') {
+                title = "Welcome Gift! 🎁";
+                message = `You received ${transaction.amount} BDT as a Welcome Bonus!`;
+                type = "success";
+            } 
+            else if (transaction.type === 'credit') {
+                title = "Wallet Credited 💰";
+                message = `Your account has been credited with ${transaction.amount} BDT.`;
+                type = "success";
+            }
+
+            // Create Notification Object
+            const notification = {
+                userId: transaction.userId, // Link to the specific user
+                title: title,
+                message: message,
+                type: type, 
+                link: "/profile", // Redirect user to wallet when clicked
+                date: new Date(),
+                isRead: false
+            };
+
+            // Insert into DB
+            await notificationCollection.insertOne(notification);
+        }
+
+        res.send(result);
+    } catch (error) {
+        console.error("Transaction Error:", error);
+        res.status(500).send({ message: "Failed to save transaction" });
+    }
+});
+
+
     // POST new question
     app.post("/api/questions", async (req, res) => {
       const payload = req.body;
@@ -1652,6 +1705,8 @@ app.patch("/api/admin/approve-payment/:id", verifyFireBaseToken, verifyAdmin, as
       let userUpdate = {};
       let finalExpiryDate = new Date(); 
 
+      const paymentAmount = parseFloat(amount);
+
       // ✅ UPDATE 3: Insert Recharge Logic Here
       if (planType === 'recharge') {
           // ⚡ WALLET RECHARGE LOGIC
@@ -1659,7 +1714,7 @@ app.patch("/api/admin/approve-payment/:id", verifyFireBaseToken, verifyAdmin, as
           finalExpiryDate = new Date(); 
 
           userUpdate = {
-              $inc: { wallet_balance: parseFloat(amount) } // 
+              $inc: { wallet_balance: paymentAmount } // 
           };
       }
       else if (planType === 'teacher') {
@@ -1728,6 +1783,96 @@ app.patch("/api/admin/approve-payment/:id", verifyFireBaseToken, verifyAdmin, as
       // 7. Send Response
       if(paymentUpdateResult.modifiedCount > 0 || userUpdateResult.modifiedCount > 0 || userUpdateResult.upsertedCount > 0){
           
+        // ============================================================
+        // 🔵 1. NEW: LOG USER TRANSACTION (For Recharge Only)
+        // ============================================================
+        if (planType === 'recharge') {
+            try {
+                // Calculate new balance for log
+                const currentBalance = user.wallet_balance || 0;
+                const newBalance = currentBalance + paymentAmount;
+
+                await transactionCollection.insertOne({
+                    userId: user._id.toString(),
+                    email: user.email,
+                    amount: paymentAmount,
+                    type: "credit", // Money IN
+                    category: "wallet_recharge",
+                    details: { 
+                        description: "Wallet Recharge Approved by Admin",
+                        paymentId: id
+                    },
+                    balanceAfter: newBalance,
+                    createdAt: new Date().toISOString()
+                });
+                console.log(`✅ Transaction logged for User: ${user.email}`);
+            } catch (txError) {
+                console.error("❌ Failed to log user transaction", txError);
+            }
+        }
+        // ============================================================
+
+        // ============================================================
+          // 🟢 NEW: REFERRAL BONUS LOGIC (Wrapped safely)
+          // ============================================================
+          try {
+            // 1. Check if user was referred by someone
+            if (user.referred_by) {
+                const referrer = await userCollection.findOne({ referral_link: user.referred_by });
+                
+                // 2. Only give bonus if referrer exists AND payment amount > 0
+                if (referrer && amount > 0) {
+                    const bonusPercent = 0.20; // 20%
+                    const bonusAmount = Math.floor(parseFloat(amount) * bonusPercent);
+
+                    if (bonusAmount > 0) {
+                        // A. Add money to Referrer Wallet
+                        await userCollection.updateOne(
+                            { _id: referrer._id },
+                            { $inc: { wallet_balance: bonusAmount } }
+                        );
+
+                        // 1. Calculate the NEW balance for the referrer
+                        const newReferrerBalance = (referrer.wallet_balance || 0) + bonusAmount;
+
+                        // B. [Expert Requirement] Record the Transaction
+                        // Assuming you have a 'transactionCollection'
+                        await transactionCollection.insertOne({
+                            userId: referrer._id.toString(),
+                            email: referrer.email,
+                            amount: bonusAmount,
+                            type: "referral_bonus",
+
+                            // ✅ NEW FIELD: Save the Friend's ID so we can group earnings later
+                            sourceUserId: user._id.toString(),
+
+                            details: { 
+                                description: `Referral Bonus from ${user.name}`,
+                                planType: planType
+                            },
+                            balanceAfter: newReferrerBalance,
+                            createdAt: new Date().toISOString(),
+                        });
+
+                        // C. Notify the Referrer
+                        await sendNotification({
+                            userId: referrer._id.toString(),
+                            title: "Referral Bonus! 🎁",
+                            message: `You earned ৳${bonusAmount} because your friend ${user.name} subscribed!`,
+                            type: "success",
+                            link: "/profile"
+                        }, { notificationCollection });
+                    }
+                }
+            }
+          } catch (referralError) {
+             // We log the error but DO NOT crash the request. The user still gets their subscription.
+             console.error("Referral Bonus Error:", referralError);
+          }
+          // ============================================================
+          // 🔴 END REFERRAL LOGIC
+          // ============================================================
+
         let title = "Subscription Activated! 🎉";
         let message = `Your ${planType} plan is now active for ${durationDays} days.`;
 
@@ -1861,7 +2006,7 @@ app.patch("/api/users/deduct-question-limit", verifyFireBaseToken, async (req, r
         amount: 0, // কোনো টাকা কাটা হয়নি
         quotaDeducted: count, // কতগুলো প্রশ্ন কাটা হলো
         type: "quota_usage", // ট্রানজ্যাকশন টাইপ
-        details: details || { note: "Used for question creation" },
+        details: details || { description: "Used for question creation" },
         remainingQuota: remaining, // অবশিষ্ট কোটা
         createdAt: new Date().toISOString(),
       };
@@ -2023,6 +2168,87 @@ app.delete("/api/admin/notifications/cleanup", verifyFireBaseToken, verifyAdmin,
         res.send({ success: true, deletedCount: result.deletedCount });
     } catch (error) {
         res.status(500).send({ message: "Cleanup failed" });
+    }
+});
+
+
+
+
+// GET: My Referrals with Exact Earnings
+app.get("/api/my-referrals/:referralCode", async (req, res) => {
+    const code = req.params.referralCode;
+
+    try {
+        const referrerUser = await userCollection.findOne({ referral_link: code });
+        if (!referrerUser) return res.send([]);
+
+        const referrerIdStr = referrerUser._id.toString();
+
+        const pipeline = [
+            // 1. Find all users invited by this code
+            { $match: { referred_by: code } },
+
+            // 2. Convert their _id to string for matching
+            { $addFields: { userIdStr: { $toString: "$_id" } } },
+
+            // 3. JOIN with Transactions Collection
+            {
+                $lookup: {
+                    from: "transactions", // Your transactions collection name
+                    let: { friendId: "$userIdStr" },
+                    pipeline: [
+                        { $match: {
+                            $expr: {
+                                $and: [
+                                    // Match transaction type
+                                    { $eq: ["$type", "referral_bonus"] },
+                                    // Match the Friend's ID (The field we added in Step 1)
+                                    { $eq: ["$sourceUserId", "$$friendId"] },
+                                    // Ensure it belongs to the Referrer
+                                    { $eq: ["$userId", referrerIdStr] } 
+                                ]
+                            }
+                        }}
+                    ],
+                    as: "earnings"
+                }
+            },
+
+            // 4. Calculate Total Amount from that array
+            {
+                $addFields: {
+                    totalBonusEarned: { $sum: "$earnings.amount" }
+                }
+            },
+
+            // 5. Clean up output
+            {
+                $project: {
+                    name: 1,
+                    email: 1,
+                    photoURL: 1,
+                    joinDate: "$_id", // Timestamp from ID
+                    totalBonusEarned: 1 // The new calculated field
+                }
+            }
+        ];
+
+        const referrals = await userCollection.aggregate(pipeline).toArray();
+
+        // Safe mapping
+        const safeData = referrals.map(u => ({
+            _id: u._id,
+            name: u.name,
+            photo: u.photoURL || "https://i.ibb.co/5GzXkwq/user.png",
+            joinDate: u._id.getTimestamp(),
+            totalEarned: u.totalBonusEarned || 0 // Default to 0
+        }));
+
+        res.send(safeData);
+
+    } catch (error) {
+        console.error("Referral Stats Error:", error);
+        res.status(500).send([]);
     }
 });
 
