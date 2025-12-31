@@ -1886,7 +1886,7 @@ app.patch("/api/admin/approve-payment/:id", verifyFireBaseToken, verifyAdmin, as
                             title: "Referral Bonus! 🎁",
                             message: `You earned ৳${bonusAmount} because your friend ${user.name} subscribed!`,
                             type: "success",
-                            link: "/profile"
+                            link: "/my-referrals"
                         }, { notificationCollection });
                     }
                 }
