@@ -2445,9 +2445,11 @@ app.post("/api/payment/pay-with-wallet", verifyFireBaseToken, async (req, res) =
     // await client.close();
   }
 }
+
 run().catch(console.dir);
 
 app.get("/", (req, res) => {
+  console.log("mcq bank server is running..... from home route by zulfikar");
   res.send("mcq bank server is running.....");
 });
 
