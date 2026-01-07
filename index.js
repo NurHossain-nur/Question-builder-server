@@ -21,6 +21,7 @@ const moment = require('moment-timezone');
 app.use(cors({
   origin: [
     "https://avijatra.com",
+    "https://api.avijatra.com",
     "https://www.avijatra.com"
   ],
   credentials: true
