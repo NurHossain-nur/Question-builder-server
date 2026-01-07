@@ -24,7 +24,8 @@ app.use(cors({
     "https://api.avijatra.com",
     "https://www.avijatra.com"
   ],
-  credentials: true
+  credentials: true,
+  allowedHeaders: ['Authorization', 'Content-Type']
 }));
 
 app.use(express.json({ limit: '5mb' }));
