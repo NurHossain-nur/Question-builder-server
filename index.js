@@ -169,9 +169,17 @@ async function run() {
           difficulty,
           medium,
           search,
+          type,
+          page = 1,
+          limit = 25
         } = req.query;
 
         console.log("Incoming query:", req.query);
+
+        // 1. Convert page & limit to integers
+        const pageInt = parseInt(page);
+        const limitInt = parseInt(limit);
+        const skip = (pageInt - 1) * limitInt;
 
         const query = {};
 
@@ -180,6 +188,7 @@ async function run() {
         if (subject) query.subject = subject;
         if (chapter) query.chapter = chapter;
         if (topic) query.topic = topic;
+        if (type) query.questionType = type;
         if (difficulty) query.difficulty = difficulty;
         if (medium) query.medium = medium;
 
@@ -202,8 +211,21 @@ async function run() {
           ];
         }
 
-        const questions = await mcqCollection.find(query).toArray();
-        res.json(questions);
+        // 2. Run two queries: One for data, one for total count (for UI pagination)
+        const questions = await mcqCollection
+          .find(query)
+          .skip(skip)
+          .limit(limitInt)
+          .toArray();
+
+        const totalCount = await mcqCollection.countDocuments(query);
+        // 3. Send structured response
+        res.json({
+          questions,
+          totalCount,
+          currentPage: pageInt,
+          totalPages: Math.ceil(totalCount / limitInt)
+        });
       } catch (error) {
         console.error("Error fetching questions:", error);
         res.status(500).json({ error: "Failed to fetch questions" });
@@ -1078,78 +1100,72 @@ app.get("/api/practice-stats", verifyFireBaseToken, async (req, res) => {
 
 
 
-// ✅ GET /api/practice-questions (Updated for Topic Support)
+// ✅ GET /api/practice-questions (Strict Security Added)
 app.get("/api/practice-questions", verifyFireBaseToken, async (req, res) => {
   try {
-    // 1. Extract 'topic' from query
     const { subject, chapter, topic } = req.query; 
     const email = req.decoded.email;
+    const FREE_LIMIT = 5; // 🔒 Enforce limit on server
 
     if (!subject || !chapter) {
       return res.status(400).send({ message: "Subject and Chapter required" });
     }
 
-    // 2. Get User Group
-    const user = await userCollection.findOne({ email });
+    const query = { subject, chapter, questionType: "বহুনির্বাচনি প্রশ্ন" };
+    if (topic) query.topic = topic;
+
+    const historyMatch = { userEmail: email, subject, chapter };
+    if (topic) historyMatch.topic = topic;
+
+    // ⚡ Parallel Execution
+    const [user, statsData, totalCount] = await Promise.all([
+      userCollection.findOne({ email }), // Need full user object for subscription check
+      db.collection("practice_history").aggregate([
+        { $match: historyMatch },
+        { $group: { _id: null, totalAttempts: { $sum: 1 }, totalCorrect: { $sum: { $cond: ["$isCorrect", 1, 0] } }, totalWrong: { $sum: { $cond: ["$isCorrect", 0, 1] } } } }
+      ]).toArray(),
+      mcqCollection.countDocuments(query)
+    ]);
+
+    // 1. Check Premium Status (Backend Logic)
+    const sub = user?.subscriptions?.practice; // Assuming 'practice' is the plan key
+    const now = new Date();
+    const expiryDate = sub?.expiryDate ? new Date(sub.expiryDate) : null;
+    const isPremium = sub?.isActive && expiryDate && expiryDate > now;
+
+    // 2. Get Stats
+    const resultStats = statsData.length > 0 ? statsData[0] : { totalAttempts: 0, totalCorrect: 0, totalWrong: 0 };
+    const totalDone = resultStats.totalAttempts;
+
+    // 🔒 SECURITY CHECK: If Free User & Limit Reached -> STOP.
+    if (!isPremium && totalDone >= FREE_LIMIT) {
+        return res.send({
+            isLocked: true, // 🚩 Flag to tell frontend "STOP HERE"
+            message: "Free limit reached",
+            questions: [], // ❌ Send NO questions
+            totalQuestions: totalCount,
+            prevCorrect: resultStats.totalCorrect,
+            prevWrong: resultStats.totalWrong
+        });
+    }
+
+    // 3. Normal Flow (Only if allowed)
     const userGroup = user?.studentProfile?.group;
-
-    // 3. Build Query
-    const query = {
-      subject: subject,
-      chapter: chapter,
-      questionType: "বহুনির্বাচনি প্রশ্ন"
-    };
-
-    // ✅ NEW: If topic is provided (e.g., Bangla 1st), filter by it
-    if (topic) {
-        query.topic = topic;
-    }
-
-    // 🔒 Admission Filter Logic
     if (userGroup === "Admission") {
-      query.$or = [
-        { tags: "Admission Exam Question" },
-        { source: "Admission Exam Question" }
-      ];
+      query.$or = [{ tags: "Admission Exam Question" }, { source: "Admission Exam Question" }];
     }
 
-    // 4. Fetch Questions (Now filtered by Topic if applicable)
     const questions = await mcqCollection.find(query)
       .sort({ _id: 1 }) 
+      .skip(totalDone) 
+      .limit(50) 
       .toArray();
 
-    // 5. Calculate Stats (Specific to this Chapter OR Topic)
-    
-    // Build the match object for history
-    const historyMatch = { 
-        userEmail: email, 
-        subject: subject, 
-        chapter: chapter 
-    };
-
-    // ✅ NEW: If practicing a topic, only count history for that topic
-    // This ensures "Resume" starts at Q1 for 'Topic A' even if you finished 'Topic B'
-    if (topic) {
-        historyMatch.topic = topic;
-    }
-
-    const stats = await db.collection("practice_history").aggregate([
-        { $match: historyMatch },
-        { 
-            $group: { 
-                _id: null, 
-                totalAttempts: { $sum: 1 }, 
-                totalCorrect: { $sum: { $cond: ["$isCorrect", 1, 0] } },
-                totalWrong: { $sum: { $cond: ["$isCorrect", 0, 1] } } 
-            } 
-        }
-    ]).toArray();
-
-    const resultStats = stats.length > 0 ? stats[0] : { totalAttempts: 0, totalCorrect: 0, totalWrong: 0 };
-
     res.send({
+        isLocked: false,
         questions: questions,
-        lastIndex: resultStats.totalAttempts, 
+        totalQuestions: totalCount,
+        globalStart: totalDone,
         prevCorrect: resultStats.totalCorrect,
         prevWrong: resultStats.totalWrong      
     });
@@ -1159,6 +1175,45 @@ app.get("/api/practice-questions", verifyFireBaseToken, async (req, res) => {
     res.status(500).send({ message: "Server Error" });
   }
 });
+
+
+// ✅ DELETE /api/reset-progress (Allows user to start over)
+app.delete("/api/reset-progress", verifyFireBaseToken, async (req, res) => {
+  try {
+    const { subject, chapter, topic } = req.query;
+    const email = req.decoded.email;
+
+    if (!subject || !chapter) {
+      return res.status(400).send({ message: "Subject and Chapter required" });
+    }
+
+    const query = { 
+        userEmail: email, 
+        subject: subject, 
+        chapter: chapter 
+    };
+    
+    // If resetting a specific topic, only delete that topic's history
+    if (topic) {
+        query.topic = topic;
+    }
+
+    // Delete the practice history logs
+    const result = await db.collection("practice_history").deleteMany(query);
+
+    res.send({ 
+        success: true, 
+        message: "Progress reset successfully", 
+        deletedCount: result.deletedCount 
+    });
+
+  } catch (error) {
+    console.error("Error resetting progress:", error);
+    res.status(500).send({ message: "Server Error" });
+  }
+});
+
+
 
 // ✅ POST /api/save-progress
 app.post("/api/save-progress", verifyFireBaseToken, async (req, res) => {
