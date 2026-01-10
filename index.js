@@ -157,80 +157,130 @@ async function run() {
       }
     };
 
-    // Replace both GET endpoints with this single one:
-    app.get("/api/questions", verifyFireBaseToken,    async (req, res) => {
-      try {
-        const {
-          group,
-          class: cls,
-          subject,
-          chapter,
-          topic,
-          difficulty,
-          medium,
-          search,
-          type,
-          page = 1,
-          limit = 25
-        } = req.query;
+    // ✅ Corrected Backend Endpoint
+app.get("/api/questions", verifyFireBaseToken, async (req, res) => {
+  try {
+    const {
+      group,
+      class: cls,
+      subject,
+      chapter,
+      topic,
+      difficulty,
+      medium,
+      
+      board,
+      year,
+      level,
+      source,
+      subSource,
+      tag,
+      
+      search,
+      type,
+      page = 1,
+      limit = 25
+    } = req.query;
 
-        console.log("Incoming query:", req.query);
+    console.log("Incoming query:", req.query);
 
-        // 1. Convert page & limit to integers
-        const pageInt = parseInt(page);
-        const limitInt = parseInt(limit);
-        const skip = (pageInt - 1) * limitInt;
+    const pageInt = parseInt(page);
+    const limitInt = parseInt(limit);
+    const skip = (pageInt - 1) * limitInt;
 
-        const query = {};
+    // ✅ FIX 1: Initialize query with an empty $and array
+    const query = { $and: [] };
 
-        if (group) query.group = group;
-        if (cls) query.class = cls;
-        if (subject) query.subject = subject;
-        if (chapter) query.chapter = chapter;
-        if (topic) query.topic = topic;
-        if (type) query.questionType = type;
-        if (difficulty) query.difficulty = difficulty;
-        if (medium) query.medium = medium;
+    // --- A. Basic Filters (Pushing to $and is safer) ---
+    if (group) query.$and.push({ group });
+    if (cls) query.$and.push({ class: cls });
+    if (subject) query.$and.push({ subject });
+    if (chapter) query.$and.push({ chapter });
+    if (topic) query.$and.push({ topic });
+    if (difficulty) query.$and.push({ difficulty });
+    if (medium) query.$and.push({ medium });
+    if (level) query.$and.push({ level });
+    if (source) query.$and.push({ source });
 
-        if (search) {
-          const searchRegex = new RegExp(search, "i");
-          query.$or = [
-            // ১. প্রশ্নের টেক্সট খুঁজবে (Dot notation জরুরি)
-            { "question.text": searchRegex },
-            
-            // ২. অপশনের টেক্সট খুঁজবে (MongoDB অটোমেটিক অ্যারের ভেতর খুঁজবে)
-            { "options.text": searchRegex },
-            
-            // ৩. সলিউশন খুঁজবে
-            { "solution.text": searchRegex },
-            { "explanation.text": searchRegex },
-            { subject: searchRegex },
-            { chapter: searchRegex },
-            { topic: searchRegex },
-            { tags: searchRegex },
-          ];
-        }
+    // --- B. Sidebar Array Logic ---
+    
+    // 1. Year Filter: Checks inside subSource.year
+    if (year) {
+        query.$and.push({ "subSource.year": year });
+    }
 
-        // 2. Run two queries: One for data, one for total count (for UI pagination)
-        const questions = await mcqCollection
-          .find(query)
-          .skip(skip)
-          .limit(limitInt)
-          .toArray();
+    // 2. Board Filter: Checks inside subSource.text
+    if (board) {
+        query.$and.push({ "subSource.text": board });
+    }
 
-        const totalCount = await mcqCollection.countDocuments(query);
-        // 3. Send structured response
-        res.json({
-          questions,
-          totalCount,
-          currentPage: pageInt,
-          totalPages: Math.ceil(totalCount / limitInt)
+    // 3. SubSource Filter: Checks inside subSource.text
+    if (subSource) {
+        query.$and.push({ "subSource.text": subSource });
+    }
+
+    // 4. Tag Filter: Checks if 'tags' array contains value
+    if (tag) {
+        query.$and.push({ tags: tag });
+    }
+
+    // --- C. Quick Filter (Type) ---
+    if (type && type !== "All") {
+        query.$and.push({
+            $or: [
+                { questionType: type },
+                { tags: type },          
+                { mcqnSubType: type }    
+            ]
         });
-      } catch (error) {
-        console.error("Error fetching questions:", error);
-        res.status(500).json({ error: "Failed to fetch questions" });
-      }
+    }
+
+    // --- D. Search Logic ---
+    // ✅ FIX 2: Push Search to $and (don't overwrite root $or)
+    if (search) {
+      const searchRegex = new RegExp(search, "i");
+      query.$and.push({
+        $or: [
+          { "question.text": searchRegex },
+          { "options.text": searchRegex },
+          { "solution.text": searchRegex },
+          { "explanation.text": searchRegex },
+          { subject: searchRegex },
+          { chapter: searchRegex },
+          { topic: searchRegex },
+          { tags: searchRegex },
+          { "subSource.text": searchRegex }
+        ]
+      });
+    }
+
+    // ✅ FIX 3: Cleanup - If $and is empty, remove it to find ALL documents
+    if (query.$and.length === 0) {
+        delete query.$and;
+    }
+
+    // Execution
+    const questions = await mcqCollection
+      .find(query)
+      // .sort({ _id: -1 })
+      .skip(skip)
+      .limit(limitInt)
+      .toArray();
+
+    const totalCount = await mcqCollection.countDocuments(query);
+
+    res.json({
+      questions,
+      totalCount,
+      currentPage: pageInt,
+      totalPages: Math.ceil(totalCount / limitInt)
     });
+
+  } catch (error) {
+    console.error("Error fetching questions:", error);
+    res.status(500).json({ error: "Failed to fetch questions" });
+  }
+});
 
       
 
