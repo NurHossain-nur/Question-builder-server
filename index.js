@@ -136,7 +136,7 @@ async function run() {
         req.decoded = decodedUser;
         next();
       } catch (error) {
-        return res.status(403).send({ error: "Forbidden - invalid token" });
+        return res.status(401).send({ error: "Unauthorized Access - invalid token" });
       }
 
       //   next();
