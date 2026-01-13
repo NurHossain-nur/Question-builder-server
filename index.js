@@ -136,7 +136,7 @@ async function run() {
         req.decoded = decodedUser;
         next();
       } catch (error) {
-        return res.status(401).send({ error: "Unauthorized - invalid token" });
+        return res.status(403).send({ error: "Forbidden - invalid token" });
       }
 
       //   next();
@@ -150,10 +150,10 @@ async function run() {
       const user = await userCollection.findOne({ email: email });
 
       // Check if role is teacher OR coaching_center OR admin
-      if ( user?.role === 'admin' || user?.role === 'modaretor') {
+      if ( user?.role === 'admin' || user?.role === 'moderator') {
         next();
       } else {
-        return res.status(403).send({ error: "Forbidden access: Admins & Moderators only" });
+        return res.status(403).send({ error: "Forbidden access: Teachers only" });
       }
     };
 
