@@ -1198,7 +1198,7 @@ app.get("/api/practice-questions", verifyFireBaseToken, async (req, res) => {
       return res.status(400).send({ message: "Subject and Chapter required" });
     }
 
-    const query = { subject, chapter, questionType: "বহুনির্বাচনি প্রশ্ন" };
+    const query = { subject, chapter, questionType: { $in: ["বহুনির্বাচনি প্রশ্ন", "MCQ", "mcq", "Mcq"] } };
     if (topic) query.topic = topic;
 
     const historyMatch = { userEmail: email, subject, chapter };
@@ -1422,6 +1422,99 @@ app.get("/api/user-stats", verifyFireBaseToken, async (req, res) => {
 
   } catch (error) {
     console.error("Error fetching user stats:", error);
+    res.status(500).send({ message: "Server Error" });
+  }
+});
+
+
+// ✅ GET /api/user-stats (Updated for Granular Progress)
+app.get("/api/job-user-stats", verifyFireBaseToken, async (req, res) => {
+  try {
+    const email = req.decoded.email;
+
+    const stats = await db.collection("practice_history").aggregate([
+      { $match: { userEmail: email } },
+      {
+        $facet: {
+          // 1. Global Overview (For Top Card)
+          global: [
+            { 
+              $group: { 
+                _id: null, 
+                totalSolved: { $sum: 1 },
+                totalCorrect: { $sum: { $cond: ["$isCorrect", 1, 0] } }
+              } 
+            }
+          ],
+          // 2. Detailed Breakdown (For Progress Bars)
+          // We group by Subject, Chapter, AND Topic so the frontend can filter freely
+          details: [
+            { 
+              $group: { 
+                _id: { 
+                  subject: "$subject", 
+                  chapter: "$chapter",
+                  topic: "$topic" 
+                }, 
+                solved: { $sum: 1 },
+                correct: { $sum: { $cond: ["$isCorrect", 1, 0] } }
+              } 
+            }
+          ]
+        }
+      }
+    ]).toArray();
+
+    const globalData = stats[0].global[0] || { totalSolved: 0, totalCorrect: 0 };
+    const detailsData = stats[0].details || [];
+
+    res.send({
+      totalSolved: globalData.totalSolved,
+      totalCorrect: globalData.totalCorrect,
+      // Calculate global accuracy here or on frontend
+      accuracy: globalData.totalSolved > 0 
+        ? Math.round((globalData.totalCorrect / globalData.totalSolved) * 100) 
+        : 0,
+      details: detailsData // ✅ Sending the breakdown array
+    });
+
+  } catch (error) {
+    console.error("Error fetching user stats:", error);
+    res.status(500).send({ message: "Server Error" });
+  }
+});
+
+
+// ✅ GET /api/job-question-counts (Get Total Available Questions)
+app.get("/api/job-question-counts", async (req, res) => {
+  try {
+    // Only count Job Preparation questions
+    const counts = await mcqCollection.aggregate([
+      { $match: { group: "Job Preparation" } }, 
+      {
+        $group: {
+          _id: {
+            subject: "$subject",
+            chapter: "$chapter",
+            topic: "$topic"
+          },
+          totalQuestions: { $sum: 1 }
+        }
+      }
+    ]).toArray();
+
+    // Transform into a cleaner structure for frontend lookup
+    // Format: { "Subject_Chapter_Topic": 50 }
+    const countMap = {};
+    counts.forEach(item => {
+        const key = `${item._id.subject}_${item._id.chapter}_${item._id.topic}`;
+        countMap[key] = item.totalQuestions;
+    });
+
+    res.send(countMap);
+
+  } catch (error) {
+    console.error("Error fetching question counts:", error);
     res.status(500).send({ message: "Server Error" });
   }
 });
