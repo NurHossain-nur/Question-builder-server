@@ -16,17 +16,17 @@ const port = process.env.PORT || 5000;
 const moment = require('moment-timezone');
 
 // Middleware
-// app.use(cors());
+app.use(cors());
 
-app.use(cors({
-  origin: [
-    "https://avijatra.com",
-    "https://api.avijatra.com",
-    "https://www.avijatra.com"
-  ],
-  credentials: true,
-  allowedHeaders: ['Authorization', 'Content-Type']
-}));
+// app.use(cors({
+//   origin: [
+//     "https://avijatra.com",
+//     "https://api.avijatra.com",
+//     "https://www.avijatra.com"
+//   ],
+//   credentials: true,
+//   allowedHeaders: ['Authorization', 'Content-Type']
+// }));
 
 app.use(express.json({ limit: '5mb' }));
 app.use(express.urlencoded({ extended: true, limit: '5mb' }));
@@ -41,9 +41,9 @@ admin.initializeApp({
   credential: admin.credential.cert(serviceAccount)
 });
 
-// const uri = `mongodb+srv://${process.env.DB_ADMIN}:${process.env.DB_PASS}@cluster0.zmtgsgq.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0`;
+const uri = `mongodb+srv://${process.env.DB_ADMIN}:${process.env.DB_PASS}@cluster0.zmtgsgq.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0`;
 
-const uri = `mongodb://${process.env.DB_ADMIN}:${process.env.DB_PASS}@127.0.0.1:27017/${process.env.DB_NAME}?authSource=admin`;
+// const uri = `mongodb://${process.env.DB_ADMIN}:${process.env.DB_PASS}@127.0.0.1:27017/${process.env.DB_NAME}?authSource=admin`;
 
 // Create a MongoClient with a MongoClientOptions object to set the Stable API version
 const client = new MongoClient(uri, {
@@ -1150,6 +1150,43 @@ app.get("/api/practice-stats", verifyFireBaseToken, async (req, res) => {
 
 
 
+// 1. ✅ GET /api/practice/wrong-questions (Fetch Actual Question Details)
+app.get("/api/practice/wrong-questions", verifyFireBaseToken, async (req, res) => {
+    try {
+        const { subject, chapter, topic } = req.query;
+        const email = req.decoded.email;
+
+        // 1. Find history entries where isCorrect is FALSE
+        const query = {
+            userEmail: email, // Matching your schema
+            subject,
+            chapter,
+            isCorrect: false
+        };
+        if (topic) query.topic = topic;
+
+        const wrongEntries = await db.collection("practice_history").find(query).toArray();
+        
+        if (wrongEntries.length === 0) return res.send([]);
+
+        // 2. Extract Question IDs (Convert String to ObjectId)
+        const questionIds = wrongEntries.map(entry => new ObjectId(entry.questionId));
+
+        // 3. Fetch the actual Question Data from MCQ Collection
+        const questions = await mcqCollection.find({ 
+            _id: { $in: questionIds } 
+        }).toArray();
+
+        res.send(questions);
+
+    } catch (err) {
+        console.error("Error fetching wrong questions:", err);
+        res.status(500).send({ error: "Failed to fetch" });
+    }
+});
+
+
+
 // ✅ GET /api/practice-questions (Strict Security Added)
 app.get("/api/practice-questions", verifyFireBaseToken, async (req, res) => {
   try {
@@ -1211,13 +1248,27 @@ app.get("/api/practice-questions", verifyFireBaseToken, async (req, res) => {
       .limit(50) 
       .toArray();
 
+
+    const wrongCountQuery = {
+        userEmail: req.decoded.email,
+        subject: req.query.subject,
+        chapter: req.query.chapter,
+        isCorrect: false
+    };
+    if (req.query.topic) wrongCountQuery.topic = req.query.topic;
+    
+    const totalWrongCount = await db.collection("practice_history").countDocuments(wrongCountQuery);
+    // 👆 END NEW BLOCK
+
     res.send({
         isLocked: false,
         questions: questions,
         totalQuestions: totalCount,
         globalStart: totalDone,
         prevCorrect: resultStats.totalCorrect,
-        prevWrong: resultStats.totalWrong      
+        prevWrong: resultStats.totalWrong,
+        
+        totalWrongCount: totalWrongCount
     });
 
   } catch (error) {
